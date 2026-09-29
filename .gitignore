@@ -1,0 +1,10 @@
+# AgentDesk local overrides
+apps/web/node_modules/
+apps/web/dist/
+.tools/
+.env.local
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example

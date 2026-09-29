@@ -1,0 +1,15 @@
+{
+  "name": "agentdesk",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Private local WorkBuddy-compatible shell on OpenClaw",
+  "scripts": {
+    "setup": "powershell -ExecutionPolicy Bypass -File ./scripts/setup.ps1",
+    "start": "powershell -ExecutionPolicy Bypass -File ./scripts/start.ps1",
+    "test:compat": "powershell -ExecutionPolicy Bypass -File ./scripts/test-compat.ps1",
+    "web:dev": "npm --prefix apps/web run dev",
+    "web:build": "npm --prefix apps/web run build",
+    "web:preview": "npm --prefix apps/web run preview",
+    "bridge": "node apps/bridge/src/server.mjs"
+  }
+}
