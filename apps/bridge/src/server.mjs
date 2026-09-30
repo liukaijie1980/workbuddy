@@ -483,6 +483,29 @@ async function handle(req, res) {
       return send(res, 200, listSkillsCompat());
     }
 
+    if (req.method === "GET" && p === "/api/skills/detail") {
+      const name = String(url.searchParams.get("name") || "").trim();
+      if (!name || name.includes("..") || name.includes("/") || name.includes("\\")) {
+        return send(res, 400, { error: "invalid name" });
+      }
+      const candidates = [
+        { source: "openclaw-workspace", file: path.join(WORKSPACE, "skills", name, "SKILL.md") },
+        { source: "workbuddy-user", file: path.join(WB_SKILLS, name, "SKILL.md") },
+      ];
+      for (const c of candidates) {
+        if (fs.existsSync(c.file)) {
+          const body = fs.readFileSync(c.file, "utf8");
+          return send(res, 200, {
+            name,
+            source: c.source,
+            path: c.file,
+            body: body.slice(0, 40000),
+          });
+        }
+      }
+      return send(res, 404, { error: "skill not found", name });
+    }
+
     if (req.method === "GET" && p === "/api/tasks") {
       return send(res, 200, { tasks: readJson(TASKS_FILE, []) });
     }

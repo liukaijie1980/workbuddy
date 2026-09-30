@@ -195,6 +195,27 @@ export async function fetchLibraryTree(settings: AgentDeskSettings) {
   }>;
 }
 
+export async function fetchLibraryFile(settings: AgentDeskSettings, relPath: string) {
+  const q = encodeURIComponent(relPath);
+  return bridgeFetch(settings, `/api/library/file?path=${q}`) as Promise<{
+    path: string;
+    abs?: string;
+    size?: number;
+    binary?: boolean;
+    preview: string | null;
+  }>;
+}
+
+export async function fetchSkillDetail(settings: AgentDeskSettings, name: string) {
+  const q = encodeURIComponent(name);
+  return bridgeFetch(settings, `/api/skills/detail?name=${q}`) as Promise<{
+    name: string;
+    source: string;
+    path: string;
+    body: string;
+  }>;
+}
+
 export async function attachLibrary(
   settings: AgentDeskSettings,
   paths: string[],
