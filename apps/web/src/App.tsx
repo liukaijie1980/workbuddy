@@ -8,6 +8,7 @@ import {
   fetchCompat,
   fetchCron,
   fetchLibraryTree,
+  fetchLocalConfig,
   fetchWbSessions,
   importWorkBuddy,
   loadSettings,
@@ -104,6 +105,29 @@ export default function App() {
   useEffect(() => {
     saveSettings(settings);
   }, [settings]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await fetchLocalConfig(settings);
+        if (cancelled || !cfg?.token) return;
+        setSettings((s) => {
+          // fill empty, or replace if current token fails later via health refresh
+          if (!s.token.trim() || s.token.trim() !== cfg.token) {
+            return { ...s, token: cfg.token || s.token };
+          }
+          return s;
+        });
+      } catch {
+        /* bridge may be down on first paint */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function refreshHealth() {
     const g = await probeGateway(settings);

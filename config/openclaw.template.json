@@ -9,7 +9,7 @@
         "default": true,
         "identity": {
           "name": "AgentDesk",
-          "theme": "private local workbench compatible with WorkBuddy skills",
+          "theme": "standalone local AI workbench",
           "emoji": "AD"
         }
       }
@@ -42,9 +42,7 @@
   },
   "skills": {
     "load": {
-      "extraDirs": [
-        "~/.workbuddy/skills"
-      ],
+      "extraDirs": [],
       "watch": true
     },
     "install": {

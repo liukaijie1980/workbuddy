@@ -25,7 +25,7 @@ const WB_SKILLS = path.join(HOME, ".workbuddy", "skills");
 const WB_ROOT = path.join(HOME, "WorkBuddy");
 
 function ensureDirs() {
-  for (const d of [LIBRARY, LIB_MINE, LIB_WB, LIB_OUT, STATE_DIR]) {
+  for (const d of [LIBRARY, LIB_MINE, LIB_WB, LIB_OUT, STATE_DIR, path.join(LIBRARY, "imports")]) {
     fs.mkdirSync(d, { recursive: true });
   }
   if (!fs.existsSync(CRON_FILE)) fs.writeFileSync(CRON_FILE, "[]\n");
@@ -369,6 +369,26 @@ async function handle(req, res) {
       });
     }
 
+    if (req.method === "GET" && p === "/api/local-config") {
+      // Loopback-only convenience for local UI; never expose remotely.
+      const ra = req.socket.remoteAddress || "";
+      const local = ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
+      if (!local) return send(res, 403, { error: "loopback only" });
+      let token = "";
+      try {
+        const cfg = JSON.parse(fs.readFileSync(path.join(OPENCLAW, "openclaw.json"), "utf8"));
+        token = cfg?.gateway?.auth?.token || "";
+      } catch {
+        /* ignore */
+      }
+      return send(res, 200, {
+        gatewayUrl: "http://127.0.0.1:18789",
+        bridgeUrl: `http://127.0.0.1:${PORT}`,
+        token,
+        model: "openclaw/default",
+      });
+    }
+
     if (req.method === "GET" && p === "/api/library/tree") {
       return send(res, 200, {
         root: LIBRARY,
@@ -568,11 +588,24 @@ ensureDirs();
 if (!fs.existsSync(path.join(LIB_MINE, "README.md"))) {
   fs.writeFileSync(
     path.join(LIB_MINE, "README.md"),
-    `# AgentDesk 资料库 · 我的文档\n\n这里对应 WorkBuddy「我的文档」语义。\n\n- \`mine/\`：个人资料\n- \`workbuddy/\`：从本机 WorkBuddy 工作区导入/链接\n- \`outputs/\`：任务产物回写\n`,
+    `# AgentDesk 资料库 · 我的文档
+
+AgentDesk 可独立运行，不依赖腾讯 WorkBuddy。
+
+- mine/：个人资料
+- imports/：外部导入
+- workbuddy/：可选，仅在导入本机 WorkBuddy 时使用
+- outputs/：任务产物回写
+`,
     "utf8",
   );
 }
-importAllWorkBuddy();
+// WorkBuddy import is optional and on-demand (POST /api/workbuddy/import).
+if (fs.existsSync(WB_DB) || fs.existsSync(WB_ROOT)) {
+  console.log("[agentdesk-bridge] WorkBuddy detected; import available via API/UI");
+} else {
+  console.log("[agentdesk-bridge] standalone mode (no WorkBuddy install)");
+}
 startCronLoop();
 
 const server = http.createServer((req, res) => {

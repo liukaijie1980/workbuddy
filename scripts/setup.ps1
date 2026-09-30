@@ -62,6 +62,20 @@ if (Test-Path $ConfigPath) {
 
 $template = Get-Content $TemplatePath -Raw -Encoding UTF8 | ConvertFrom-Json
 $template.gateway.auth.token = $token
+
+# Standalone by default: only load optional WorkBuddy skills dir IF it exists.
+$extraDirs = @()
+$RepoSkills = Join-Path $RepoRoot "skills"
+$WbSkillsDir = Join-Path $env:USERPROFILE ".workbuddy\skills"
+if (Test-Path $RepoSkills) { $extraDirs += $RepoSkills.Replace("\", "/") }
+if (Test-Path $WbSkillsDir) {
+  $extraDirs += "~/.workbuddy/skills"
+  Write-Host "Optional: detected WorkBuddy skills at $WbSkillsDir"
+} else {
+  Write-Host "Standalone mode: WorkBuddy not required / not found"
+}
+$template.skills.load.extraDirs = $extraDirs
+
 $json = $template | ConvertTo-Json -Depth 30
 [System.IO.File]::WriteAllText($ConfigPath, $json + "`n")
 Write-Host "Wrote $ConfigPath"
@@ -70,28 +84,43 @@ if (-not (Test-Path $WorkspaceSkills)) {
   New-Item -ItemType Directory -Path $WorkspaceSkills -Force | Out-Null
 }
 
-if (Test-Path $WorkbuddySkill) {
-  $dest = Join-Path $WorkspaceSkills "image-to-cad-dxf"
-  if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-  Copy-Item $WorkbuddySkill $dest -Recurse -Force
-  Write-Host "Synced skill image-to-cad-dxf -> $dest"
-} else {
-  Write-Host "Skill not found: $WorkbuddySkill (skip sync)" -ForegroundColor Yellow
+# Prefer repo-bundled skills (independent of WorkBuddy)
+if (Test-Path $RepoSkills) {
+  Get-ChildItem $RepoSkills -Directory | ForEach-Object {
+    $dest = Join-Path $WorkspaceSkills $_.Name
+    if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+    Copy-Item $_.FullName $dest -Recurse -Force
+    Write-Host "Synced repo skill $($_.Name) -> $dest"
+  }
 }
 
-# P1 library roots
+# Optional bonus: if WorkBuddy user skill exists and not already synced, import it
+$WorkbuddySkill = Join-Path $env:USERPROFILE ".workbuddy\skills\image-to-cad-dxf"
+if ((Test-Path $WorkbuddySkill) -and -not (Test-Path (Join-Path $WorkspaceSkills "image-to-cad-dxf"))) {
+  Copy-Item $WorkbuddySkill (Join-Path $WorkspaceSkills "image-to-cad-dxf") -Recurse -Force
+  Write-Host "Optional import: image-to-cad-dxf from WorkBuddy"
+}
+
+# P1 library roots (self-owned; WorkBuddy import is optional via UI)
 $LibraryRoot = Join-Path $OpenClawDir "workspace\library"
-foreach ($d in @("mine", "workbuddy", "outputs")) {
+foreach ($d in @("mine", "imports", "outputs")) {
   $p = Join-Path $LibraryRoot $d
   if (-not (Test-Path $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
 }
+# keep legacy workbuddy folder name for compatibility, but don't require it
+$legacyWb = Join-Path $LibraryRoot "workbuddy"
+if (-not (Test-Path $legacyWb)) { New-Item -ItemType Directory -Path $legacyWb -Force | Out-Null }
+
 $AgentsMd = Join-Path $OpenClawDir "workspace\AGENTS.md"
 $LibHint = @"
 
 ## AgentDesk Library
 
+AgentDesk runs standalone (OpenClaw + local Web). WorkBuddy is optional.
+
 - library/mine — personal docs
-- library/workbuddy — imported WorkBuddy workspaces
+- library/imports — optional imported external workspaces (including WorkBuddy)
+- library/workbuddy — optional WorkBuddy links (compat)
 - library/outputs — write task artifacts here
 "@
 if (Test-Path $AgentsMd) {

@@ -1,21 +1,35 @@
 # AgentDesk
 
-本地私有化的 WorkBuddy 兼容壳：以 **OpenClaw** 为 Agent 运行时，自研 Web UI，优先保证 Skill / MCP / 资料目录资产可复用。
+本地私有化的 AI 工作台（AgentDesk）：以 **OpenClaw** 为运行时，自研 Web UI。
 
-> 本项目**不是**腾讯 WorkBuddy 的复制品。UI、品牌与交互均为独立设计；兼容目标是开放资产格式（Agent Skills / OpenClaw）。
+> **可完全独立运行，不依赖腾讯 WorkBuddy。**  
+> WorkBuddy 仅作为可选兼容源：若本机已安装，可一键导入其 Skill / 工作区；未安装不影响聊天、资料库、定时任务。
+
+> 本项目不是腾讯 WorkBuddy 的复制品。UI、品牌与交互均为独立设计；兼容目标是开放资产格式（Agent Skills / OpenClaw）。
 
 ## 架构
 
 ```
 浏览器 (AgentDesk Web)
-        │  HTTP /v1/chat/completions  + 静态页
+        │
         ▼
+Bridge (:3090) ── 资料库 / 定时 / 审计（自有数据）
+        │
 OpenClaw Gateway (:18789)
         │
-        ├─ skills.load.extraDirs → ~/.workbuddy/skills
-        ├─ workspace → ~/.openclaw/workspace（可挂载资料库目录）
-        └─ 模型 Provider（OpenAI 兼容 / 本地 Ollama 等）
+        ├─ workspace/skills（仓库自带 + 用户 Skill）
+        ├─ 可选：~/.workbuddy/skills（仅当目录存在）
+        └─ 模型 Provider（如移动云 GLM）
 ```
+
+## 依赖关系
+
+| 组件 | 是否必须 |
+|------|----------|
+| Node 24+ / 仓库 `.tools` 便携 Node | 必须 |
+| OpenClaw | 必须（运行时） |
+| 模型 API Key | 必须（对话） |
+| 腾讯 WorkBuddy 安装 | **不需要**（可选导入） |
 
 ## 快速开始
 

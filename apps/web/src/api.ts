@@ -273,3 +273,11 @@ export async function createTask(
     }),
   });
 }
+
+export async function fetchLocalConfig(settings: AgentDeskSettings): Promise<{
+  token?: string;
+  gatewayUrl?: string;
+  bridgeUrl?: string;
+}> {
+  return bridgeFetch(settings, "/api/local-config");
+}
