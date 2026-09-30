@@ -252,6 +252,51 @@ export async function fetchWbSessions(settings: AgentDeskSettings) {
   }>;
 }
 
+export type ConversationSummary = {
+  id: string;
+  title: string;
+  updatedAt?: string;
+  createdAt?: string;
+  messageCount?: number;
+  preview?: string;
+};
+
+export type Conversation = ConversationSummary & {
+  messages: ChatMessage[];
+};
+
+export async function fetchConversations(settings: AgentDeskSettings) {
+  return bridgeFetch(settings, "/api/conversations") as Promise<{
+    conversations: ConversationSummary[];
+  }>;
+}
+
+export async function fetchConversation(settings: AgentDeskSettings, id: string) {
+  return bridgeFetch(
+    settings,
+    `/api/conversations/${encodeURIComponent(id)}`,
+  ) as Promise<Conversation>;
+}
+
+export async function upsertConversation(
+  settings: AgentDeskSettings,
+  id: string,
+  messages: ChatMessage[],
+  title?: string,
+) {
+  return bridgeFetch(settings, `/api/conversations/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages, title }),
+  }) as Promise<Conversation>;
+}
+
+export async function deleteConversation(settings: AgentDeskSettings, id: string) {
+  return bridgeFetch(settings, `/api/conversations/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function fetchCron(settings: AgentDeskSettings) {
   return bridgeFetch(settings, "/api/cron") as Promise<{ jobs: CronJob[] }>;
 }

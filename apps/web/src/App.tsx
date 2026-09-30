@@ -3,9 +3,12 @@ import {
   attachLibrary,
   createCron,
   createTask,
+  deleteConversation,
   deleteCron,
   fetchAudit,
   fetchCompat,
+  fetchConversation,
+  fetchConversations,
   fetchCron,
   fetchLibraryFile,
   fetchLibraryTree,
@@ -19,14 +22,16 @@ import {
   runCronNow,
   saveSettings,
   streamChat,
+  upsertConversation,
   type AgentDeskSettings,
   type AuditEntry,
   type ChatMessage,
+  type ConversationSummary,
   type CronJob,
   type LibraryNode,
 } from "./api";
 
-type Tab = "library" | "skills" | "cron" | "sessions" | "audit" | "settings";
+type Tab = "chats" | "library" | "skills" | "cron" | "wb" | "audit" | "settings";
 
 type WbSession = {
   id: string;
@@ -218,10 +223,11 @@ function FocusPanel({
 
 export default function App() {
   const [settings, setSettings] = useState<AgentDeskSettings>(() => loadSettings());
-  const [tab, setTab] = useState<Tab>("library");
+  const [tab, setTab] = useState<Tab>("chats");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [statusHint, setStatusHint] = useState<string | null>(null);
   const [gatewayOk, setGatewayOk] = useState(false);
   const [bridgeOk, setBridgeOk] = useState(false);
   const [gatewayDetail, setGatewayDetail] = useState("未探测");
@@ -231,6 +237,7 @@ export default function App() {
   const [tree, setTree] = useState<LibraryNode[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [focus, setFocus] = useState<Focus | null>(null);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [compat, setCompat] = useState<{
     matched?: string[];
     onlyInWorkBuddy?: string[];
@@ -290,6 +297,12 @@ export default function App() {
       /* bridge may be down */
     }
     try {
+      const c = await fetchConversations(settings);
+      setConversations(c.conversations || []);
+    } catch {
+      /* ignore */
+    }
+    try {
       setCompat(await fetchCompat(settings));
     } catch {
       /* ignore */
@@ -321,6 +334,24 @@ export default function App() {
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.gatewayBase, settings.bridgeBase, settings.token]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!settings.conversationId) return;
+      try {
+        const row = await fetchConversation(settings, settings.conversationId);
+        if (cancelled) return;
+        if (row?.messages?.length) setMessages(row.messages);
+      } catch {
+        /* new conversation id not yet persisted */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const canSend = useMemo(() => draft.trim().length > 0 && !busy, [draft, busy]);
 
@@ -409,11 +440,13 @@ export default function App() {
     const nextMessages: ChatMessage[] = [...messages, { role: "user", content }];
     setMessages(nextMessages);
     setBusy(true);
+    setStatusHint("已发送，等待 Gateway/模型（通常 5–30 秒，请勿刷新）…");
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     try {
       let assembled = "";
       for await (const chunk of streamChat(settings, nextMessages)) {
+        if (!assembled) setStatusHint(null);
         assembled += chunk;
         const snapshot = assembled;
         setMessages((prev) => {
@@ -421,6 +454,21 @@ export default function App() {
           copy[copy.length - 1] = { role: "assistant", content: snapshot };
           return copy;
         });
+      }
+      if (!assembled.trim()) {
+        throw new Error(
+          "模型返回了空内容（常见于思考过程过长）。请再点发送，或在消息末尾加 /think off",
+        );
+      }
+      const finalMessages: ChatMessage[] = [
+        ...nextMessages,
+        { role: "assistant", content: assembled },
+      ];
+      setMessages(finalMessages);
+      try {
+        await upsertConversation(settings, settings.conversationId, finalMessages);
+      } catch (persistErr) {
+        console.warn("persist conversation failed", persistErr);
       }
       setGatewayOk(true);
       void refreshSideData();
@@ -432,7 +480,32 @@ export default function App() {
       setGatewayDetail(message.slice(0, 160));
     } finally {
       setBusy(false);
+      setStatusHint(null);
     }
+  }
+
+  async function openConversation(id: string) {
+    if (busy) return;
+    setError(null);
+    setStatusHint(null);
+    try {
+      const row = await fetchConversation(settings, id);
+      setSettings((s) => ({ ...s, conversationId: row.id }));
+      setMessages(row.messages || []);
+      setTab("chats");
+      setFocus(null);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  async function removeConversation(id: string) {
+    await deleteConversation(settings, id);
+    if (settings.conversationId === id) {
+      newConversation();
+    }
+    const c = await fetchConversations(settings);
+    setConversations(c.conversations || []);
   }
 
   function newConversation() {
@@ -441,6 +514,7 @@ export default function App() {
     setSelected(new Set());
     setFocus(null);
     setError(null);
+    setTab("chats");
   }
 
   const skillNames = useMemo(() => {
@@ -479,10 +553,11 @@ export default function App() {
           <nav className="tabs">
             {(
               [
+                ["chats", "会话"],
                 ["library", "资料库"],
                 ["skills", "Skills"],
                 ["cron", "定时"],
-                ["sessions", "WB会话"],
+                ["wb", "WB对照"],
                 ["audit", "审计"],
                 ["settings", "设置"],
               ] as Array<[Tab, string]>
@@ -499,6 +574,54 @@ export default function App() {
           </nav>
 
           <div className="side-body">
+            {tab === "chats" && (
+              <section>
+                <div className="row">
+                  <h2 className="panel-title">AgentDesk 会话</h2>
+                  <button type="button" className="ghost" onClick={newConversation}>
+                    新建
+                  </button>
+                </div>
+                <p className="hint">
+                  这里是本系统 Web 聊天记录（会随发送更新）。不是腾讯 WorkBuddy 会话。
+                </p>
+                <ul className="skill-list">
+                  {conversations.map((c) => (
+                    <li key={c.id}>
+                      <button
+                        type="button"
+                        className={`list-hit ${settings.conversationId === c.id ? "on" : ""}`}
+                        onClick={() => void openConversation(c.id)}
+                      >
+                        <strong>{c.title || c.id.slice(0, 8)}</strong>
+                        <span>
+                          {(c.messageCount ?? 0)} 条 · {c.updatedAt?.replace("T", " ").slice(0, 16) || ""}
+                          {c.preview ? ` · ${c.preview}` : ""}
+                        </span>
+                      </button>
+                      <div className="row gap">
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() =>
+                            void removeConversation(c.id).catch((e) => setError(String(e)))
+                          }
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                  {conversations.length === 0 && (
+                    <li>
+                      <strong>暂无会话</strong>
+                      <span>发送一条消息后会出现在这里</span>
+                    </li>
+                  )}
+                </ul>
+              </section>
+            )}
+
             {tab === "library" && (
               <section>
                 <div className="row">
@@ -656,10 +779,12 @@ export default function App() {
               </section>
             )}
 
-            {tab === "sessions" && (
+            {tab === "wb" && (
               <section>
-                <h2 className="panel-title">WorkBuddy 会话</h2>
-                <p className="hint">只读镜像本机 workbuddy.db；点击在右侧查看详情。</p>
+                <h2 className="panel-title">WorkBuddy 对照（只读）</h2>
+                <p className="hint">
+                  镜像本机 workbuddy.db，仅作兼容对照，不会写入 Web 聊天。本系统会话请看「会话」页。
+                </p>
                 <ul className="skill-list">
                   {sessions.map((s) => (
                     <li key={s.id}>
@@ -677,7 +802,7 @@ export default function App() {
                   ))}
                   {sessions.length === 0 && (
                     <li>
-                      <strong>无会话</strong>
+                      <strong>无 WB 会话</strong>
                       <span>未检测到 WorkBuddy 数据库（独立模式正常）</span>
                     </li>
                   )}
@@ -774,10 +899,16 @@ export default function App() {
             ) : (
               messages.map((msg, index) => (
                 <div key={`${msg.role}-${index}`} className={`bubble ${msg.role}`}>
-                  {msg.content || (busy && index === messages.length - 1 ? "…" : "")}
+                  {msg.content ||
+                    (busy && index === messages.length - 1
+                      ? statusHint || "模型处理中…"
+                      : "")}
                 </div>
               ))
             )}
+            {statusHint && !messages.some((m) => m.role === "assistant" && !m.content) ? (
+              <div className="hint pad">{statusHint}</div>
+            ) : null}
             {error ? <div className="bubble error">{error}</div> : null}
           </div>
 

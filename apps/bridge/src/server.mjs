@@ -20,6 +20,7 @@ const STATE_DIR = path.join(OPENCLAW, "agentdesk");
 const CRON_FILE = path.join(STATE_DIR, "cron.json");
 const AUDIT_FILE = path.join(STATE_DIR, "audit.jsonl");
 const TASKS_FILE = path.join(STATE_DIR, "tasks.json");
+const CONVERSATIONS_FILE = path.join(STATE_DIR, "conversations.json");
 const WB_DB = path.join(HOME, ".workbuddy", "workbuddy.db");
 const WB_SKILLS = path.join(HOME, ".workbuddy", "skills");
 const WB_ROOT = path.join(HOME, "WorkBuddy");
@@ -30,6 +31,7 @@ function ensureDirs() {
   }
   if (!fs.existsSync(CRON_FILE)) fs.writeFileSync(CRON_FILE, "[]\n");
   if (!fs.existsSync(TASKS_FILE)) fs.writeFileSync(TASKS_FILE, "[]\n");
+  if (!fs.existsSync(CONVERSATIONS_FILE)) fs.writeFileSync(CONVERSATIONS_FILE, "[]\n");
   if (!fs.existsSync(AUDIT_FILE)) fs.writeFileSync(AUDIT_FILE, "");
 }
 
@@ -52,6 +54,37 @@ function readJson(file, fallback) {
 
 function writeJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
+}
+
+function loadConversations() {
+  const rows = readJson(CONVERSATIONS_FILE, []);
+  return Array.isArray(rows) ? rows : [];
+}
+
+function saveConversations(rows) {
+  writeJson(CONVERSATIONS_FILE, rows.slice(0, 200));
+}
+
+function conversationTitleFromMessages(messages, fallback = "新会话") {
+  const firstUser = (messages || []).find((m) => m?.role === "user" && String(m.content || "").trim());
+  if (!firstUser) return fallback;
+  const t = String(firstUser.content).replace(/\s+/g, " ").trim();
+  return t.slice(0, 48) || fallback;
+}
+
+function summarizeConversation(c) {
+  return {
+    id: c.id,
+    title: c.title || "新会话",
+    updatedAt: c.updatedAt,
+    createdAt: c.createdAt,
+    messageCount: Array.isArray(c.messages) ? c.messages.length : 0,
+    preview: (() => {
+      const msgs = c.messages || [];
+      const last = [...msgs].reverse().find((m) => m?.content);
+      return last ? String(last.content).replace(/\s+/g, " ").trim().slice(0, 80) : "";
+    })(),
+  };
 }
 
 function send(res, status, body, headers = {}) {
@@ -526,6 +559,67 @@ async function handle(req, res) {
       writeJson(TASKS_FILE, tasks.slice(0, 200));
       audit("task.create", { id: task.id, title: task.title });
       return send(res, 200, task);
+    }
+
+    if (req.method === "GET" && p === "/api/conversations") {
+      const list = loadConversations()
+        .map(summarizeConversation)
+        .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+      return send(res, 200, { conversations: list });
+    }
+
+    if (req.method === "POST" && p === "/api/conversations") {
+      const body = await readBody(req);
+      const now = new Date().toISOString();
+      const messages = Array.isArray(body?.messages) ? body.messages : [];
+      const row = {
+        id: body?.id || crypto.randomUUID(),
+        title: body?.title || conversationTitleFromMessages(messages),
+        messages,
+        createdAt: now,
+        updatedAt: now,
+      };
+      const all = loadConversations().filter((c) => c.id !== row.id);
+      all.unshift(row);
+      saveConversations(all);
+      audit("conversation.create", { id: row.id, title: row.title });
+      return send(res, 200, row);
+    }
+
+    if (req.method === "GET" && p.startsWith("/api/conversations/")) {
+      const id = decodeURIComponent(p.slice("/api/conversations/".length));
+      const row = loadConversations().find((c) => c.id === id);
+      if (!row) return send(res, 404, { error: "not found" });
+      return send(res, 200, row);
+    }
+
+    if (req.method === "PUT" && p.startsWith("/api/conversations/")) {
+      const id = decodeURIComponent(p.slice("/api/conversations/".length));
+      const body = await readBody(req);
+      const all = loadConversations();
+      const idx = all.findIndex((c) => c.id === id);
+      const now = new Date().toISOString();
+      const messages = Array.isArray(body?.messages) ? body.messages : idx >= 0 ? all[idx].messages : [];
+      const row = {
+        id,
+        title: body?.title || conversationTitleFromMessages(messages, idx >= 0 ? all[idx].title : "新会话"),
+        messages,
+        createdAt: idx >= 0 ? all[idx].createdAt : now,
+        updatedAt: now,
+      };
+      if (idx >= 0) all.splice(idx, 1);
+      all.unshift(row);
+      saveConversations(all);
+      audit("conversation.upsert", { id, messageCount: messages.length });
+      return send(res, 200, row);
+    }
+
+    if (req.method === "DELETE" && p.startsWith("/api/conversations/")) {
+      const id = decodeURIComponent(p.slice("/api/conversations/".length));
+      const all = loadConversations().filter((c) => c.id !== id);
+      saveConversations(all);
+      audit("conversation.delete", { id });
+      return send(res, 200, { ok: true });
     }
 
     if (req.method === "GET" && p === "/api/cron") {
