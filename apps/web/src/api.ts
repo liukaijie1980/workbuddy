@@ -131,15 +131,21 @@ export async function probeBridge(settings: AgentDeskSettings): Promise<{
   }
 }
 
+export type StreamEvent =
+  | { kind: "delta"; text: string }
+  | { kind: "status"; text: string };
+
 export async function* streamChat(
   settings: AgentDeskSettings,
   messages: ChatMessage[],
   opts?: { signal?: AbortSignal; idleMs?: number; overallMs?: number },
-): AsyncGenerator<string> {
+): AsyncGenerator<StreamEvent> {
   const base = resolveBase(settings.gatewayBase);
   const idleMs = opts?.idleMs ?? 120_000;
   const overallMs = opts?.overallMs ?? 600_000;
   const signal = opts?.signal;
+
+  yield { kind: "status", text: "正在连接 Gateway /v1/chat/completions…" };
 
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
@@ -162,11 +168,14 @@ export async function* streamChat(
   }
   if (!res.body) throw new Error("Gateway 未返回流式响应体");
 
+  yield { kind: "status", text: "Gateway 已连接，等待模型与工具返回可见内容…" };
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   const startedAt = Date.now();
   let lastByteAt = Date.now();
+  let announcedSilent = false;
 
   const readWithIdle = (): Promise<ReadableStreamReadResult<Uint8Array>> =>
     new Promise((resolve, reject) => {
@@ -234,7 +243,16 @@ export async function* streamChat(
           };
           if (json.error?.message) throw new Error(json.error.message);
           const delta = json.choices?.[0]?.delta?.content;
-          if (delta) yield delta;
+          if (delta) {
+            announcedSilent = false;
+            yield { kind: "delta", text: delta };
+          } else if (!announcedSilent) {
+            announcedSilent = true;
+            yield {
+              kind: "status",
+              text: "收到网关事件，但还没有可见文字（通常在调用工具或思考）",
+            };
+          }
         } catch (err) {
           if (err instanceof SyntaxError) continue;
           throw err;
@@ -295,6 +313,14 @@ export type UploadedLibraryFile = {
   size: number;
   abs?: string;
 };
+
+export async function fetchRuntimeActivity(
+  settings: AgentDeskSettings,
+  sinceIso: string,
+): Promise<{ lines: Array<{ at?: string; text: string; key: string }> }> {
+  const q = encodeURIComponent(sinceIso);
+  return bridgeFetch(settings, `/api/runtime/activity?since=${q}`);
+}
 
 export async function uploadLibraryFiles(
   settings: AgentDeskSettings,

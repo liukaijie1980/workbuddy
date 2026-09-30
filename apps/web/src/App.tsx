@@ -13,6 +13,7 @@ import {
   fetchLibraryFile,
   fetchLibraryTree,
   fetchLocalConfig,
+  fetchRuntimeActivity,
   fetchSkillDetail,
   fetchWbSessions,
   importWorkBuddy,
@@ -230,8 +231,12 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [statusHint, setStatusHint] = useState<string | null>(null);
+  const [activity, setActivity] = useState<Array<{ id: string; at: string; text: string }>>([]);
+  const [elapsedSec, setElapsedSec] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const busySinceRef = useRef<number>(0);
+  const activitySinceRef = useRef<string>("");
+  const seenActivityRef = useRef<Set<string>>(new Set());
   const [gatewayOk, setGatewayOk] = useState(false);
   const [bridgeOk, setBridgeOk] = useState(false);
   const [gatewayDetail, setGatewayDetail] = useState("未探测");
@@ -466,10 +471,14 @@ export default function App() {
     if (!files.length || uploading) return;
     setUploading(true);
     setError(null);
+    busySinceRef.current = Date.now();
+    setElapsedSec(0);
+    pushActivity(`正在上传 ${files.length} 个文件到资料库…`);
     try {
       const result = await uploadLibraryFiles(settings, files);
       const uploaded = result.files || [];
       if (!uploaded.length) throw new Error("上传未返回文件");
+      pushActivity(`上传完成：${uploaded.map((f) => f.name).join("、")}`);
       setPendingFiles((prev) => {
         const seen = new Set(prev.map((f) => f.path));
         const next = [...prev];
@@ -485,6 +494,54 @@ export default function App() {
       setUploading(false);
     }
   }
+
+  function pushActivity(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setActivity((prev) => {
+      if (prev[prev.length - 1]?.text === trimmed) return prev;
+      const at = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      return [...prev, { id: `${Date.now()}-${prev.length}`, at, text: trimmed }].slice(-16);
+    });
+    setStatusHint(trimmed);
+  }
+
+  useEffect(() => {
+    if (!busy && !uploading) return;
+    const timer = window.setInterval(() => {
+      setElapsedSec(Math.max(0, Math.round((Date.now() - busySinceRef.current) / 1000)));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [busy, uploading]);
+
+  useEffect(() => {
+    if (!busy) return;
+    let stop = false;
+    const pull = async () => {
+      try {
+        const data = await fetchRuntimeActivity(
+          settings,
+          activitySinceRef.current || new Date().toISOString(),
+        );
+        if (stop) return;
+        for (const line of data.lines || []) {
+          if (!line?.text || seenActivityRef.current.has(line.key)) continue;
+          seenActivityRef.current.add(line.key);
+          pushActivity(line.text);
+        }
+      } catch {
+        /* activity feed is best-effort */
+      }
+    };
+    void pull();
+    const timer = window.setInterval(() => void pull(), 2000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+    // pull uses latest settings captured when busy starts
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy]);
 
   function removePendingFile(path: string) {
     setPendingFiles((prev) => prev.filter((f) => f.path !== path));
@@ -538,8 +595,15 @@ export default function App() {
     setDraft("");
     setPendingFiles([]);
     setError(null);
+    setActivity([]);
+    seenActivityRef.current = new Set();
+    activitySinceRef.current = new Date().toISOString();
+    busySinceRef.current = Date.now();
+    setElapsedSec(0);
+    setBusy(true);
 
     if (attachPathsList.length) {
+      pushActivity(`正在把 ${attachPathsList.length} 个附件挂到任务…`);
       try {
         const { snippet } = await attachLibrary(settings, attachPathsList);
         await createTask(
@@ -550,38 +614,34 @@ export default function App() {
         content = content
           ? `${snippet}\n\n${content}`
           : `${snippet}\n\n请基于以上资料继续。`;
+        pushActivity("附件已写入任务，准备发送给模型");
       } catch (e) {
         setError(String(e instanceof Error ? e.message : e));
         setDraft(restoreDraft);
         setPendingFiles(restorePending);
+        setBusy(false);
+        setStatusHint(null);
         return;
       }
     }
 
     const nextMessages: ChatMessage[] = [...messages, { role: "user", content }];
     setMessages(nextMessages);
-    setBusy(true);
-    busySinceRef.current = Date.now();
-    setStatusHint("已发送，等待 Gateway/模型… 长时间无字多半在跑工具，可点取消。");
+    pushActivity("已提交对话，开始等待 Gateway");
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
     const ac = new AbortController();
     abortRef.current = ac;
-    const tick = window.setInterval(() => {
-      const sec = Math.round((Date.now() - busySinceRef.current) / 1000);
-      setStatusHint((prev) => {
-        if (!prev) return prev;
-        return `处理中已 ${sec}s（工具调用期间可能暂无文字输出，可点取消）…`;
-      });
-    }, 5000);
 
     try {
       let assembled = "";
-      for await (const chunk of streamChat(settings, nextMessages, { signal: ac.signal })) {
-        if (!assembled) {
-          setStatusHint(null);
+      for await (const ev of streamChat(settings, nextMessages, { signal: ac.signal })) {
+        if (ev.kind === "status") {
+          pushActivity(ev.text);
+          continue;
         }
-        assembled += chunk;
+        if (!assembled) pushActivity("模型开始输出可见文字");
+        assembled += ev.text;
         const snapshot = assembled;
         setMessages((prev) => {
           const copy = [...prev];
@@ -628,7 +688,6 @@ export default function App() {
         setGatewayDetail(message.slice(0, 160));
       }
     } finally {
-      window.clearInterval(tick);
       abortRef.current = null;
       setBusy(false);
       setStatusHint(null);
@@ -637,6 +696,7 @@ export default function App() {
 
   function onCancel() {
     abortRef.current?.abort();
+    pushActivity("用户取消，正在中断 Gateway 请求");
     setStatusHint("正在取消…");
   }
 
@@ -1065,14 +1125,11 @@ export default function App() {
                 <div key={`${msg.role}-${index}`} className={`bubble ${msg.role}`}>
                   {msg.content ||
                     (busy && index === messages.length - 1
-                      ? statusHint || "模型处理中…"
+                      ? statusHint || "正在处理…"
                       : "")}
                 </div>
               ))
             )}
-            {statusHint && !messages.some((m) => m.role === "assistant" && !m.content) ? (
-              <div className="hint pad">{statusHint}</div>
-            ) : null}
             {error ? <div className="bubble error">{error}</div> : null}
           </div>
 
@@ -1081,6 +1138,28 @@ export default function App() {
           ) : null}
 
           <div className={`composer ${dragOver ? "dragover" : ""}`}>
+            {(busy || uploading) && (
+              <div className="activity-bar" role="status" aria-live="polite">
+                <div className="activity-head">
+                  <span className="activity-dot" />
+                  <strong>{statusHint || (uploading ? "正在上传…" : "正在处理…")}</strong>
+                  <span className="activity-time">{elapsedSec}s</span>
+                  <button type="button" className="activity-cancel" onClick={onCancel}>
+                    取消
+                  </button>
+                </div>
+                {activity.length > 0 ? (
+                  <ol className="activity-log">
+                    {activity.map((line) => (
+                      <li key={line.id}>
+                        <time>{line.at}</time>
+                        <span>{line.text}</span>
+                      </li>
+                    ))}
+                  </ol>
+                ) : null}
+              </div>
+            )}
             {pendingFiles.length > 0 ? (
               <div className="composer-attachments">
                 {pendingFiles.map((f) => (

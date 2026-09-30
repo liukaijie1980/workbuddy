@@ -410,6 +410,82 @@ button {
   color: var(--ink);
 }
 
+.activity-bar {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(196, 240, 106, 0.08);
+  padding: 0.65rem 0.75rem 0.55rem;
+}
+
+.activity-head {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.activity-head strong {
+  flex: 1;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.activity-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(196, 240, 106, 0.7);
+  animation: activity-pulse 1.4s ease-out infinite;
+}
+
+@keyframes activity-pulse {
+  70% { box-shadow: 0 0 0 6px rgba(196, 240, 106, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(196, 240, 106, 0); }
+}
+
+.activity-time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+}
+
+.activity-cancel {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 0.25rem 0.7rem;
+  font-weight: 600;
+}
+
+.activity-cancel:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.activity-log {
+  list-style: none;
+  margin: 0.45rem 0 0;
+  padding: 0;
+  max-height: 7.5rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.activity-log li {
+  display: grid;
+  grid-template-columns: 4.6rem 1fr;
+  gap: 0.45rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.activity-log time {
+  font-variant-numeric: tabular-nums;
+}
+
 .composer-row {
   display: grid;
   grid-template-columns: auto 1fr auto auto;

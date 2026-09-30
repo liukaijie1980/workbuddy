@@ -65,7 +65,11 @@ if (-not (Test-Path (Join-Path $WebDir "dist\index.html"))) {
 $token = $null
 if (Test-Path $EnvFile) {
   Get-Content $EnvFile | ForEach-Object {
-    if ($_ -match '^AGENTDESK_GATEWAY_TOKEN=(.+)$') { $token = $Matches[1].Trim() }
+    if ($_ -match '^\s*#' -or $_ -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { return }
+    $name = $Matches[1]
+    $value = $Matches[2].Trim()
+    Set-Item -Path "Env:$name" -Value $value
+    if ($name -eq "AGENTDESK_GATEWAY_TOKEN") { $token = $value }
   }
 }
 

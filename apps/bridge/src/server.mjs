@@ -450,6 +450,99 @@ function startCronLoop() {
   }, 15000);
 }
 
+function describeGatewayMessage(msg) {
+  const text = String(msg || "");
+  if (!text) return null;
+  if (text.includes("[model-fetch] response")) {
+    const model = /model=(\S+)/.exec(text)?.[1] || "模型";
+    const ms = /elapsedMs=(\d+)/.exec(text)?.[1];
+    return `正在请求模型 ${model}${ms ? `（本段 ${ms}ms）` : ""}`;
+  }
+  if (text.includes("[model-fetch] error")) {
+    const message = /message=(.+)$/.exec(text)?.[1] || "模型请求失败";
+    return `模型请求失败：${message}`;
+  }
+  if (text.includes("prep stages")) return "正在准备 Agent 运行环境";
+  if (text.includes("tool-search")) return "正在装载可用工具";
+  if (text.includes("post-tool")) return "工具步骤已结束，正在整理最终回答";
+  if (text.includes("reasoning-only")) return "模型只有思考内容，正在重试可见回答";
+  if (text.includes("incomplete turn")) return "本轮回答不完整，Gateway 正在补救";
+  if (text.includes("Couldn't generate")) return "Agent 未能生成回答";
+  if (text.includes("ClientDisconnect") || text.includes("disconnected")) return "上游连接已断开";
+  if (text.includes("session-resource-loader")) return "正在加载会话资源";
+  if (text.includes("memory_index") || text.includes("memory ")) return "正在处理记忆索引";
+  return null;
+}
+
+function readFileTail(file, maxBytes = 180_000) {
+  if (!fs.existsSync(file)) return "";
+  const st = fs.statSync(file);
+  const start = Math.max(0, st.size - maxBytes);
+  const fd = fs.openSync(file, "r");
+  try {
+    const buf = Buffer.alloc(st.size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    return buf.toString("utf8");
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function parseGatewayLogLine(raw) {
+  const line = String(raw || "").trim();
+  if (!line) return null;
+  if (line.startsWith("{")) {
+    try {
+      const j = JSON.parse(line);
+      const msg = typeof j["1"] === "string" ? j["1"] : typeof j["2"] === "string" ? j["2"] : "";
+      const at = j?._meta?.date || "";
+      return { at, msg };
+    } catch {
+      return null;
+    }
+  }
+  const m = /^(\d{4}-\d{2}-\d{2}T\S+)\s+(.*)$/.exec(line);
+  if (!m) return null;
+  return { at: m[1], msg: m[2] };
+}
+
+function latestGatewayActivity(sinceMs) {
+  const day = new Date().toISOString().slice(0, 10);
+  const files = [
+    path.join(os.tmpdir(), "openclaw", `openclaw-${day}.log`),
+    path.resolve(process.cwd(), "..", "..", ".tools", "gateway.out.log"),
+    path.resolve(process.cwd(), "..", "..", ".tools", "gateway.err.log"),
+  ];
+  const items = [];
+  for (const file of files) {
+    const raw = readFileTail(file);
+    if (!raw) continue;
+    for (const line of raw.split(/\r?\n/)) {
+      const parsed = parseGatewayLogLine(line);
+      if (!parsed?.msg) continue;
+      const atMs = parsed.at ? Date.parse(parsed.at) : NaN;
+      if (!Number.isFinite(atMs)) continue;
+      if (Number.isFinite(sinceMs) && atMs + 1000 < sinceMs) continue;
+      const text = describeGatewayMessage(parsed.msg);
+      if (!text) continue;
+      items.push({
+        at: parsed.at,
+        text,
+        key: `${parsed.at}|${text}`,
+      });
+    }
+  }
+  const seen = new Set();
+  const uniq = [];
+  items.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  for (const item of items) {
+    if (seen.has(item.key)) continue;
+    seen.add(item.key);
+    uniq.push(item);
+  }
+  return uniq.slice(-8);
+}
+
 async function handle(req, res) {
   if (req.method === "OPTIONS") return send(res, 204, "");
 
@@ -463,6 +556,13 @@ async function handle(req, res) {
         service: "agentdesk-bridge",
         library: LIBRARY,
         time: new Date().toISOString(),
+      });
+    }
+
+    if (req.method === "GET" && p === "/api/runtime/activity") {
+      const since = Date.parse(url.searchParams.get("since") || "");
+      return send(res, 200, {
+        lines: latestGatewayActivity(Number.isFinite(since) ? since : Date.now() - 120_000),
       });
     }
 
