@@ -106,8 +106,12 @@ Write-Host "Bridge listening on 127.0.0.1:3090"
 Write-Host "==> Starting AgentDesk Web (http://127.0.0.1:3080)" -ForegroundColor Cyan
 if ($token) { Write-Host "Gateway Token: $token" }
 
+Write-Host "==> Building Web (so latest UI changes are served)" -ForegroundColor Cyan
 Push-Location $WebDir
 try {
+  npm run build
+  if ($LASTEXITCODE -ne 0) { throw "web build failed" }
+  Stop-Port 3080
   npm run preview
 } finally {
   Pop-Location

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent } from "react";
 import {
   attachLibrary,
   createCron,
@@ -22,6 +22,7 @@ import {
   runCronNow,
   saveSettings,
   streamChat,
+  uploadLibraryFiles,
   upsertConversation,
   type AgentDeskSettings,
   type AuditEntry,
@@ -29,6 +30,7 @@ import {
   type ConversationSummary,
   type CronJob,
   type LibraryNode,
+  type UploadedLibraryFile,
 } from "./api";
 
 type Tab = "chats" | "library" | "skills" | "cron" | "wb" | "audit" | "settings";
@@ -228,11 +230,17 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [statusHint, setStatusHint] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const busySinceRef = useRef<number>(0);
   const [gatewayOk, setGatewayOk] = useState(false);
   const [bridgeOk, setBridgeOk] = useState(false);
   const [gatewayDetail, setGatewayDetail] = useState("未探测");
   const [bridgeDetail, setBridgeDetail] = useState("未探测");
   const [error, setError] = useState<string | null>(null);
+  const [pendingFiles, setPendingFiles] = useState<UploadedLibraryFile[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [tree, setTree] = useState<LibraryNode[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -335,6 +343,24 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.gatewayBase, settings.bridgeBase, settings.token]);
 
+  // Prevent the browser from navigating / opening the dropped file as a new page.
+  useEffect(() => {
+    const isFileDrag = (e: DragEvent) =>
+      !!e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+
+    const blockNav = (e: DragEvent) => {
+      if (!isFileDrag(e)) return;
+      e.preventDefault();
+    };
+
+    window.addEventListener("dragover", blockNav);
+    window.addEventListener("drop", blockNav);
+    return () => {
+      window.removeEventListener("dragover", blockNav);
+      window.removeEventListener("drop", blockNav);
+    };
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -353,7 +379,10 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const canSend = useMemo(() => draft.trim().length > 0 && !busy, [draft, busy]);
+  const canSend = useMemo(
+    () => (draft.trim().length > 0 || pendingFiles.length > 0) && !busy && !uploading,
+    [draft, busy, pendingFiles.length, uploading],
+  );
 
   function toggleFile(path: string, type: string) {
     if (type !== "file") return;
@@ -432,21 +461,126 @@ export default function App() {
     await attachPaths([focus.path]);
   }
 
-  async function onSend() {
-    const content = draft.trim();
-    if (!content || busy) return;
-    setDraft("");
+  async function ingestLocalFiles(fileList: FileList | File[]) {
+    const files = [...fileList].filter((f) => f && f.size > 0);
+    if (!files.length || uploading) return;
+    setUploading(true);
     setError(null);
+    try {
+      const result = await uploadLibraryFiles(settings, files);
+      const uploaded = result.files || [];
+      if (!uploaded.length) throw new Error("上传未返回文件");
+      setPendingFiles((prev) => {
+        const seen = new Set(prev.map((f) => f.path));
+        const next = [...prev];
+        for (const f of uploaded) {
+          if (!seen.has(f.path)) next.push(f);
+        }
+        return next;
+      });
+      void refreshLibrary().catch(() => undefined);
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function removePendingFile(path: string) {
+    setPendingFiles((prev) => prev.filter((f) => f.path !== path));
+  }
+
+  function isFileDragEvent(e: ReactDragEvent) {
+    return Array.from(e.dataTransfer?.types || []).includes("Files");
+  }
+
+  function onComposerDragEnter(e: ReactDragEvent) {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
+  }
+
+  function onComposerDragOver(e: ReactDragEvent) {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+    setDragOver(true);
+  }
+
+  function onComposerDragLeave(e: ReactDragEvent) {
+    if (!isFileDragEvent(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const related = e.relatedTarget as Node | null;
+    if (related && e.currentTarget.contains(related)) return;
+    setDragOver(false);
+  }
+
+  function onComposerDrop(e: ReactDragEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    if (e.dataTransfer?.files?.length) {
+      void ingestLocalFiles(e.dataTransfer.files);
+    }
+  }
+
+  async function onSend() {
+    if (busy || uploading) return;
+    let content = draft.trim();
+    const attachPathsList = pendingFiles.map((f) => f.path);
+    const restoreDraft = draft;
+    const restorePending = pendingFiles;
+    if (!content && !attachPathsList.length) return;
+
+    setDraft("");
+    setPendingFiles([]);
+    setError(null);
+
+    if (attachPathsList.length) {
+      try {
+        const { snippet } = await attachLibrary(settings, attachPathsList);
+        await createTask(
+          settings,
+          `任务 · ${attachPathsList[0]}`,
+          attachPathsList,
+        );
+        content = content
+          ? `${snippet}\n\n${content}`
+          : `${snippet}\n\n请基于以上资料继续。`;
+      } catch (e) {
+        setError(String(e instanceof Error ? e.message : e));
+        setDraft(restoreDraft);
+        setPendingFiles(restorePending);
+        return;
+      }
+    }
+
     const nextMessages: ChatMessage[] = [...messages, { role: "user", content }];
     setMessages(nextMessages);
     setBusy(true);
-    setStatusHint("已发送，等待 Gateway/模型（通常 5–30 秒，请勿刷新）…");
+    busySinceRef.current = Date.now();
+    setStatusHint("已发送，等待 Gateway/模型… 长时间无字多半在跑工具，可点取消。");
     setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const tick = window.setInterval(() => {
+      const sec = Math.round((Date.now() - busySinceRef.current) / 1000);
+      setStatusHint((prev) => {
+        if (!prev) return prev;
+        return `处理中已 ${sec}s（工具调用期间可能暂无文字输出，可点取消）…`;
+      });
+    }, 5000);
 
     try {
       let assembled = "";
-      for await (const chunk of streamChat(settings, nextMessages)) {
-        if (!assembled) setStatusHint(null);
+      for await (const chunk of streamChat(settings, nextMessages, { signal: ac.signal })) {
+        if (!assembled) {
+          setStatusHint(null);
+        }
         assembled += chunk;
         const snapshot = assembled;
         setMessages((prev) => {
@@ -473,15 +607,37 @@ export default function App() {
       setGatewayOk(true);
       void refreshSideData();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const aborted =
+        (err instanceof DOMException && err.name === "AbortError") ||
+        (err instanceof Error && /aborted|AbortError/i.test(err.message));
+      const message = aborted
+        ? "已取消本次请求。"
+        : err instanceof Error
+          ? err.message
+          : String(err);
       setError(message);
-      setMessages((prev) => prev.slice(0, -1));
-      setGatewayOk(false);
-      setGatewayDetail(message.slice(0, 160));
+      setMessages((prev) => {
+        // drop empty assistant placeholder; keep user turn
+        if (prev.length && prev[prev.length - 1]?.role === "assistant" && !prev[prev.length - 1]?.content) {
+          return prev.slice(0, -1);
+        }
+        return prev;
+      });
+      if (!aborted) {
+        setGatewayOk(false);
+        setGatewayDetail(message.slice(0, 160));
+      }
     } finally {
+      window.clearInterval(tick);
+      abortRef.current = null;
       setBusy(false);
       setStatusHint(null);
     }
+  }
+
+  function onCancel() {
+    abortRef.current?.abort();
+    setStatusHint("正在取消…");
   }
 
   async function openConversation(id: string) {
@@ -512,6 +668,7 @@ export default function App() {
     setSettings((s) => ({ ...s, conversationId: crypto.randomUUID() }));
     setMessages([]);
     setSelected(new Set());
+    setPendingFiles([]);
     setFocus(null);
     setError(null);
     setTab("chats");
@@ -655,7 +812,7 @@ export default function App() {
                     添加到任务 ({selected.size})
                   </button>
                 </div>
-                <p className="hint">单击文件 → 右侧预览；双击勾选；「添加到任务」写入草稿。</p>
+                <p className="hint">单击文件 → 右侧预览；双击勾选；「添加到任务」写入草稿。也可直接拖到下方输入框。</p>
                 <LibraryTreeView
                   nodes={tree}
                   selected={selected}
@@ -875,7 +1032,13 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="main">
+        <main
+          className={`main ${dragOver ? "file-dragover" : ""}`}
+          onDragEnter={onComposerDragEnter}
+          onDragOver={onComposerDragOver}
+          onDragLeave={onComposerDragLeave}
+          onDrop={onComposerDrop}
+        >
           <FocusPanel
             focus={focus}
             selectedCount={selected.size}
@@ -893,7 +1056,8 @@ export default function App() {
               <div className="empty">
                 <h1>资料进任务，产物回资料库。</h1>
                 <p>
-                  左侧点选对象会在上方联动区展示；勾选资料后可写入草稿并发送。
+                  可直接拖拽 / 粘贴文件到会话区，或从左侧资料库勾选后添加。发送后 Agent
+                  按路径读取资料。
                 </p>
               </div>
             ) : (
@@ -912,21 +1076,80 @@ export default function App() {
             {error ? <div className="bubble error">{error}</div> : null}
           </div>
 
-          <div className="composer">
-            <textarea
-              value={draft}
-              placeholder="描述任务… 左侧点选资料/Skill 后可写入草稿"
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void onSend();
-                }
-              }}
-            />
-            <button type="button" disabled={!canSend} onClick={() => void onSend()}>
-              {busy ? "执行中" : "发送"}
-            </button>
+          {dragOver ? (
+            <div className="main-drop-hint">松开以上传并附加到任务</div>
+          ) : null}
+
+          <div className={`composer ${dragOver ? "dragover" : ""}`}>
+            {pendingFiles.length > 0 ? (
+              <div className="composer-attachments">
+                {pendingFiles.map((f) => (
+                  <span key={f.path} className="attach-chip" title={f.path}>
+                    <span className="attach-chip-name">{f.name}</span>
+                    <button
+                      type="button"
+                      className="attach-chip-x"
+                      aria-label={`移除 ${f.name}`}
+                      onClick={() => removePendingFile(f.path)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            <div className="composer-row">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                hidden
+                onChange={(e) => {
+                  const list = e.target.files;
+                  if (list?.length) void ingestLocalFiles(list);
+                  e.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                className="composer-attach"
+                disabled={busy || uploading}
+                title="添加文件（图片、文档等）"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                {uploading ? "…" : "+"}
+              </button>
+              <textarea
+                value={draft}
+                placeholder="描述任务… 也可拖拽/粘贴文件，或点 + 选择"
+                disabled={busy}
+                onChange={(e) => setDraft(e.target.value)}
+                onDragEnter={onComposerDragEnter}
+                onDragOver={onComposerDragOver}
+                onDrop={onComposerDrop}
+                onPaste={(e) => {
+                  const items = e.clipboardData?.files;
+                  if (items && items.length > 0) {
+                    e.preventDefault();
+                    void ingestLocalFiles(items);
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void onSend();
+                  }
+                }}
+              />
+              <button type="button" disabled={!canSend} onClick={() => void onSend()}>
+                {busy ? "执行中" : uploading ? "上传中" : "发送"}
+              </button>
+              {busy ? (
+                <button type="button" className="composer-cancel" onClick={onCancel}>
+                  取消
+                </button>
+              ) : null}
+            </div>
           </div>
         </main>
       </div>

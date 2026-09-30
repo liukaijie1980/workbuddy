@@ -134,8 +134,13 @@ export async function probeBridge(settings: AgentDeskSettings): Promise<{
 export async function* streamChat(
   settings: AgentDeskSettings,
   messages: ChatMessage[],
+  opts?: { signal?: AbortSignal; idleMs?: number; overallMs?: number },
 ): AsyncGenerator<string> {
   const base = resolveBase(settings.gatewayBase);
+  const idleMs = opts?.idleMs ?? 120_000;
+  const overallMs = opts?.overallMs ?? 600_000;
+  const signal = opts?.signal;
+
   const res = await fetch(`${base}/v1/chat/completions`, {
     method: "POST",
     headers: {
@@ -148,6 +153,7 @@ export async function* streamChat(
       user: `conv:${settings.conversationId}`,
       messages,
     }),
+    signal,
   });
 
   if (!res.ok) {
@@ -159,31 +165,87 @@ export async function* streamChat(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  const startedAt = Date.now();
+  let lastByteAt = Date.now();
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n");
-    buffer = chunks.pop() ?? "";
+  const readWithIdle = (): Promise<ReadableStreamReadResult<Uint8Array>> =>
+    new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setInterval(() => {
+        if (settled) return;
+        const now = Date.now();
+        if (signal?.aborted) {
+          settled = true;
+          clearInterval(timer);
+          reject(new DOMException("Aborted", "AbortError"));
+          return;
+        }
+        if (now - startedAt > overallMs) {
+          settled = true;
+          clearInterval(timer);
+          reject(new Error(`等待模型超时（>${Math.round(overallMs / 1000)}s）。可点取消后重试，或把问题拆短。`));
+          return;
+        }
+        if (now - lastByteAt > idleMs) {
+          settled = true;
+          clearInterval(timer);
+          reject(
+            new Error(
+              `超过 ${Math.round(idleMs / 1000)}s 没有新输出（常见于工具调用卡住）。已中断，请点取消后重试，或新开会话。`,
+            ),
+          );
+        }
+      }, 1000);
 
-    for (const line of chunks) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-      const payload = trimmed.slice(5).trim();
-      if (payload === "[DONE]") return;
-      try {
-        const json = JSON.parse(payload) as {
-          choices?: Array<{ delta?: { content?: string } }>;
-          error?: { message?: string };
-        };
-        if (json.error?.message) throw new Error(json.error.message);
-        const delta = json.choices?.[0]?.delta?.content;
-        if (delta) yield delta;
-      } catch (err) {
-        if (err instanceof SyntaxError) continue;
-        throw err;
+      reader
+        .read()
+        .then((result) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(timer);
+          resolve(result);
+        })
+        .catch((err) => {
+          if (settled) return;
+          settled = true;
+          clearInterval(timer);
+          reject(err);
+        });
+    });
+
+  try {
+    while (true) {
+      const { done, value } = await readWithIdle();
+      if (done) break;
+      lastByteAt = Date.now();
+      buffer += decoder.decode(value, { stream: true });
+      const chunks = buffer.split("\n");
+      buffer = chunks.pop() ?? "";
+
+      for (const line of chunks) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") return;
+        try {
+          const json = JSON.parse(payload) as {
+            choices?: Array<{ delta?: { content?: string } }>;
+            error?: { message?: string };
+          };
+          if (json.error?.message) throw new Error(json.error.message);
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) yield delta;
+        } catch (err) {
+          if (err instanceof SyntaxError) continue;
+          throw err;
+        }
       }
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* ignore */
     }
   }
 }
@@ -224,6 +286,26 @@ export async function attachLibrary(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ paths }),
+  });
+}
+
+export type UploadedLibraryFile = {
+  path: string;
+  name: string;
+  size: number;
+  abs?: string;
+};
+
+export async function uploadLibraryFiles(
+  settings: AgentDeskSettings,
+  files: File[],
+): Promise<{ ok: boolean; files: UploadedLibraryFile[]; paths: string[] }> {
+  if (!files.length) return { ok: true, files: [], paths: [] };
+  const fd = new FormData();
+  for (const f of files) fd.append("files", f, f.name);
+  return bridgeFetch(settings, "/api/library/upload", {
+    method: "POST",
+    body: fd,
   });
 }
 

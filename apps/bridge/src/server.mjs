@@ -111,6 +111,70 @@ async function readBody(req) {
   }
 }
 
+async function readRawBody(req, limitBytes = 80 * 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size > limitBytes) {
+      throw new Error(`payload too large (max ${Math.round(limitBytes / 1024 / 1024)}MB)`);
+    }
+    chunks.push(c);
+  }
+  return Buffer.concat(chunks);
+}
+
+function sanitizeFilename(name) {
+  const base = path.basename(String(name || "file")).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim();
+  return (base || "file").slice(0, 180);
+}
+
+function uniqueLibraryRel(relDir, filename) {
+  const safe = sanitizeFilename(filename);
+  let rel = path.posix.join(relDir, safe);
+  if (!fs.existsSync(safeJoin(LIBRARY, rel))) return rel;
+  const ext = path.extname(safe);
+  const stem = path.basename(safe, ext);
+  for (let i = 1; i < 1000; i++) {
+    rel = path.posix.join(relDir, `${stem}-${i}${ext}`);
+    if (!fs.existsSync(safeJoin(LIBRARY, rel))) return rel;
+  }
+  return path.posix.join(relDir, `${stem}-${Date.now()}${ext}`);
+}
+
+function parseMultipart(buffer, boundary) {
+  const files = [];
+  const delim = Buffer.from(`--${boundary}`);
+  let pos = buffer.indexOf(delim);
+  if (pos < 0) return files;
+  pos += delim.length;
+  while (pos < buffer.length) {
+    if (buffer[pos] === 0x2d && buffer[pos + 1] === 0x2d) break;
+    if (buffer[pos] === 0x0d && buffer[pos + 1] === 0x0a) pos += 2;
+    const next = buffer.indexOf(delim, pos);
+    if (next < 0) break;
+    let partEnd = next;
+    if (partEnd >= 2 && buffer[partEnd - 2] === 0x0d && buffer[partEnd - 1] === 0x0a) {
+      partEnd -= 2;
+    }
+    const part = buffer.subarray(pos, partEnd);
+    const headerEnd = part.indexOf(Buffer.from("\r\n\r\n"));
+    if (headerEnd >= 0) {
+      const header = part.subarray(0, headerEnd).toString("utf8");
+      const body = part.subarray(headerEnd + 4);
+      const fileMatch = /filename\*?=(?:UTF-8''|")([^";]+)"?/i.exec(header);
+      let filename = fileMatch ? decodeURIComponent(fileMatch[1].replace(/"/g, "")) : "";
+      if (!filename) {
+        const plain = /filename="([^"]*)"/i.exec(header);
+        filename = plain?.[1] || "";
+      }
+      if (filename) files.push({ filename, data: body });
+    }
+    pos = next + delim.length;
+  }
+  return files;
+}
+
 function safeJoin(root, rel) {
   const cleaned = String(rel || "").replace(/^[/\\]+/, "");
   const full = path.resolve(root, cleaned);
@@ -475,6 +539,45 @@ async function handle(req, res) {
       fs.writeFileSync(abs, content, "utf8");
       audit("library.write", { path: rel });
       return send(res, 200, { ok: true, path: rel, abs });
+    }
+
+    if (req.method === "POST" && p === "/api/library/upload") {
+      const day = new Date().toISOString().slice(0, 10);
+      const relDir = `mine/inbox/${day}`;
+      const saved = [];
+      const ctype = String(req.headers["content-type"] || "");
+      if (ctype.includes("multipart/form-data")) {
+        const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(ctype);
+        const boundary = (m?.[1] || m?.[2] || "").trim();
+        if (!boundary) return send(res, 400, { error: "multipart boundary missing" });
+        const raw = await readRawBody(req);
+        const parts = parseMultipart(raw, boundary);
+        if (!parts.length) return send(res, 400, { error: "no files in multipart body" });
+        for (const part of parts) {
+          const rel = uniqueLibraryRel(relDir, part.filename);
+          const abs = safeJoin(LIBRARY, rel);
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, part.data);
+          saved.push({ path: rel, name: path.basename(rel), size: part.data.length, abs });
+        }
+      } else {
+        const body = await readBody(req);
+        const items = Array.isArray(body?.files) ? body.files : body?.name ? [body] : [];
+        if (!items.length) return send(res, 400, { error: "files required" });
+        for (const item of items) {
+          const name = item?.name || item?.filename || "file";
+          const b64 = item?.contentBase64 || item?.data;
+          if (!b64) return send(res, 400, { error: `missing contentBase64 for ${name}` });
+          const data = Buffer.from(String(b64), "base64");
+          const rel = uniqueLibraryRel(relDir, name);
+          const abs = safeJoin(LIBRARY, rel);
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, data);
+          saved.push({ path: rel, name: path.basename(rel), size: data.length, abs });
+        }
+      }
+      audit("library.upload", { count: saved.length, paths: saved.map((f) => f.path) });
+      return send(res, 200, { ok: true, files: saved, paths: saved.map((f) => f.path) });
     }
 
     if (req.method === "POST" && p === "/api/library/attach") {

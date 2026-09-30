@@ -223,6 +223,23 @@ button {
   min-width: 0;
   max-height: calc(100vh - 70px);
   overflow: hidden;
+  position: relative;
+}
+
+.main.file-dragover {
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+
+.main-drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  font-weight: 600;
+  color: var(--accent);
+  background: rgba(12, 16, 14, 0.55);
 }
 
 .focus-panel {
@@ -341,11 +358,87 @@ button {
 .composer {
   border-top: 1px solid var(--line);
   padding: 1rem 1.25rem 1.25rem;
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
   background: rgba(15, 20, 18, 0.72);
   backdrop-filter: blur(12px);
+  position: relative;
+  transition: box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.composer.dragover {
+  background: rgba(62, 110, 90, 0.28);
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 14rem;
+  padding: 0.28rem 0.45rem 0.28rem 0.55rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg2);
+  font-size: 0.82rem;
+  color: var(--ink);
+}
+
+.attach-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attach-chip-x {
+  border: 0;
+  background: transparent;
+  color: var(--muted, #9aa69d);
+  cursor: pointer;
+  padding: 0 0.15rem;
+  font-size: 1rem;
+  line-height: 1;
+}
+
+.attach-chip-x:hover {
+  color: var(--ink);
+}
+
+.composer-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  gap: 0.65rem;
+  align-items: end;
+}
+
+.composer-attach {
+  align-self: end;
+  width: 2.75rem;
+  height: 2.75rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg2);
+  color: var(--ink);
+  font-size: 1.35rem;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.composer-attach:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.composer-attach:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .composer textarea {
@@ -360,17 +453,32 @@ button {
   outline: none;
 }
 
-.composer button {
+.composer-row > button:last-child,
+.composer-row > button.composer-cancel {
   align-self: end;
   border: 0;
   border-radius: 12px;
   padding: 0.85rem 1.2rem;
-  background: var(--accent);
-  color: var(--accent-ink);
   font-weight: 600;
 }
 
-.composer button:disabled {
+.composer-row > button:not(.composer-attach):not(.composer-cancel) {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.composer-cancel {
+  background: transparent;
+  border: 1px solid var(--line) !important;
+  color: var(--ink);
+}
+
+.composer-cancel:hover {
+  border-color: var(--danger) !important;
+  color: var(--danger);
+}
+
+.composer-row > button:not(.composer-attach):disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
