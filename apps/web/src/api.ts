@@ -85,13 +85,28 @@ function authHeaders(token: string): HeadersInit {
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
+function formatHttpError(status: number, text: string, hint?: string) {
+  const body = text.trim();
+  if (body) return `${status}: ${body.slice(0, 300)}`;
+  if (status === 500 || status === 502 || status === 503 || status === 504) {
+    return `${status}: 上游无响应${hint ? `（${hint}）` : ""}。请确认 Gateway :18789 与 Bridge :3090 正在运行。`;
+  }
+  return `${status}: （空响应）`;
+}
+
 async function bridgeFetch(settings: AgentDeskSettings, path: string, init?: RequestInit) {
   const base = resolveBase(settings.bridgeBase);
   const url = `${base}${path}`;
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`无法连接 Bridge ${base || "(相对地址)"}：${msg}`);
+  }
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`${res.status}: ${text.slice(0, 300)}`);
+    throw new Error(formatHttpError(res.status, text, "Bridge/代理"));
   }
   return res.json();
 }
@@ -141,30 +156,44 @@ export async function* streamChat(
   opts?: { signal?: AbortSignal; idleMs?: number; overallMs?: number },
 ): AsyncGenerator<StreamEvent> {
   const base = resolveBase(settings.gatewayBase);
-  const idleMs = opts?.idleMs ?? 120_000;
-  const overallMs = opts?.overallMs ?? 600_000;
+  const idleMs = opts?.idleMs ?? 300_000;
+  const overallMs = opts?.overallMs ?? 1_200_000;
   const signal = opts?.signal;
 
   yield { kind: "status", text: "正在连接 Gateway /v1/chat/completions…" };
 
-  const res = await fetch(`${base}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      ...authHeaders(settings.token),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "openclaw/default",
-      stream: true,
-      user: `conv:${settings.conversationId}`,
-      messages,
-    }),
-    signal,
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${base}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(settings.token),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "openclaw/default",
+        stream: true,
+        user: `conv:${settings.conversationId}`,
+        messages,
+      }),
+      signal,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `无法连接 Gateway ${base || "(相对 /v1 → :18789)"}：${msg}。请重新运行 .\\scripts\\start.ps1`,
+    );
+  }
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`${res.status}: ${text.slice(0, 400)}`);
+    throw new Error(
+      formatHttpError(
+        res.status,
+        text,
+        "常见原因：Gateway 未启动或已崩溃，代理把 ECONNREFUSED 转成了 500",
+      ),
+    );
   }
   if (!res.body) throw new Error("Gateway 未返回流式响应体");
 
@@ -238,19 +267,38 @@ export async function* streamChat(
         if (payload === "[DONE]") return;
         try {
           const json = JSON.parse(payload) as {
-            choices?: Array<{ delta?: { content?: string } }>;
+            choices?: Array<{
+              delta?: {
+                content?: string;
+                tool_calls?: Array<{
+                  id?: string;
+                  function?: { name?: string; arguments?: string };
+                }>;
+              };
+              finish_reason?: string | null;
+            }>;
             error?: { message?: string };
           };
           if (json.error?.message) throw new Error(json.error.message);
-          const delta = json.choices?.[0]?.delta?.content;
+          const choice = json.choices?.[0];
+          const delta = choice?.delta?.content;
+          const toolCalls = choice?.delta?.tool_calls;
+          if (toolCalls?.length) {
+            for (const call of toolCalls) {
+              const name = call?.function?.name?.trim();
+              if (!name) continue;
+              announcedSilent = false;
+              yield { kind: "status", text: `模型决定调用工具 ${name}` };
+            }
+          }
           if (delta) {
             announcedSilent = false;
             yield { kind: "delta", text: delta };
-          } else if (!announcedSilent) {
+          } else if (!announcedSilent && !toolCalls?.length) {
             announcedSilent = true;
             yield {
               kind: "status",
-              text: "收到网关事件，但还没有可见文字（通常在调用工具或思考）",
+              text: "网关有事件但暂无可见文字（工具名见下方活动条；也可能在思考）",
             };
           }
         } catch (err) {
@@ -266,6 +314,11 @@ export async function* streamChat(
       /* ignore */
     }
   }
+}
+
+export function libraryRawUrl(settings: AgentDeskSettings, relPath: string) {
+  const base = settings.bridgeBase.replace(/\/$/, "");
+  return `${base}/api/library/raw?path=${encodeURIComponent(relPath)}`;
 }
 
 export async function fetchLibraryTree(settings: AgentDeskSettings) {
@@ -299,11 +352,32 @@ export async function fetchSkillDetail(settings: AgentDeskSettings, name: string
 export async function attachLibrary(
   settings: AgentDeskSettings,
   paths: string[],
+  skill?: string,
 ): Promise<{ snippet: string; paths: string[] }> {
   return bridgeFetch(settings, "/api/library/attach", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ paths }),
+    body: JSON.stringify({ paths, skill }),
+  });
+}
+
+export async function fetchSkillContract(
+  settings: AgentDeskSettings,
+  name: string,
+): Promise<{ name: string; snippet: string; python?: string; files?: string[] }> {
+  const q = encodeURIComponent(name);
+  return bridgeFetch(settings, `/api/skills/contract?name=${q}`);
+}
+
+export async function matchSkillContract(
+  settings: AgentDeskSettings,
+  text: string,
+  skill?: string,
+): Promise<{ matched: boolean; name?: string; snippet?: string }> {
+  return bridgeFetch(settings, "/api/skills/match", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, skill: skill || undefined }),
   });
 }
 
@@ -317,7 +391,7 @@ export type UploadedLibraryFile = {
 export async function fetchRuntimeActivity(
   settings: AgentDeskSettings,
   sinceIso: string,
-): Promise<{ lines: Array<{ at?: string; text: string; key: string }> }> {
+): Promise<{ lines: Array<{ at?: string; text: string; key: string; detail?: string }> }> {
   const q = encodeURIComponent(sinceIso);
   return bridgeFetch(settings, `/api/runtime/activity?since=${q}`);
 }
@@ -452,6 +526,63 @@ export async function fetchLocalConfig(settings: AgentDeskSettings): Promise<{
   token?: string;
   gatewayUrl?: string;
   bridgeUrl?: string;
+  model?: string;
 }> {
   return bridgeFetch(settings, "/api/local-config");
+}
+
+export type CatalogModel = {
+  id: string;
+  name: string;
+  ref: string;
+  vision: boolean;
+  reasoning?: boolean;
+  contextWindow?: number | null;
+};
+
+export type CatalogProvider = {
+  id: string;
+  baseUrl: string;
+  api: string;
+  timeoutSeconds?: number | null;
+  apiKeySet: boolean;
+  apiKeyHint: string;
+  models: CatalogModel[];
+};
+
+export type ModelsCatalog = {
+  configPath: string;
+  controlUi: string;
+  primary: string;
+  fallbacks: string[];
+  providers: CatalogProvider[];
+};
+
+export async function fetchModelsConfig(settings: AgentDeskSettings): Promise<ModelsCatalog> {
+  return bridgeFetch(settings, "/api/models-config");
+}
+
+export async function saveModelsConfig(
+  settings: AgentDeskSettings,
+  body: {
+    primary?: string;
+    fallbacks?: string[];
+    provider?: {
+      id: string;
+      baseUrl: string;
+      apiKey?: string;
+      modelId: string;
+      modelName?: string;
+      vision?: boolean;
+      timeoutSeconds?: number;
+      setPrimary?: boolean;
+      alias?: string;
+    };
+  },
+): Promise<ModelsCatalog & { ok?: boolean }> {
+  return bridgeFetch(settings, "/api/models-config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }

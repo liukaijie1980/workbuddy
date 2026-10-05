@@ -34,9 +34,15 @@ AgentDesk 映射：
 
 操作：
 
-- `POST /api/workbuddy/import` — 导入/链接全部 WB 工作区
-- `POST /api/library/attach` — 生成「添加到任务」提示块（对齐 WB）
-- UI：勾选文件 → 添加到任务 → 发送
+- `POST /api/workbuddy/import` — 导入/链接全部 WB 工作区，并同步 `~/.workbuddy/skills` 到工作区
+- `GET /api/skills/contract?name=` — 生成与 WorkBuddy 对齐的执行合同（技能原文、模板路径、指定 Python）
+- `POST /api/skills/match` — 按技能名或 SKILL.md 里的触发语句，把同一份执行合同自动写进即将发送的消息
+- `POST /api/library/attach` — 生成「添加到任务」提示块；可带 `skill` 把合同一并写入
+- UI：Skills 里点「写入任务草稿」会把合同写入草稿；发送时若消息命中技能名或触发语句，也会自动套上同一份合同
+
+执行合同时，模型必须从技能 `assets/` 模板改参数，不能从零重写依赖库 API。这样同一技能、同一资料才和 WorkBuddy 走同一条路径。
+
+依赖腾讯云 MCP 的内置 Skill（微信支付、腾讯文档等）**不可完整复现**。
 
 ## 任务流 / 定时 / 审计（P2）
 

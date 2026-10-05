@@ -12,8 +12,12 @@ import {
   fetchCron,
   fetchLibraryFile,
   fetchLibraryTree,
+  libraryRawUrl,
   fetchLocalConfig,
+  fetchModelsConfig,
   fetchRuntimeActivity,
+  fetchSkillContract,
+  matchSkillContract,
   fetchSkillDetail,
   fetchWbSessions,
   importWorkBuddy,
@@ -21,6 +25,7 @@ import {
   probeBridge,
   probeGateway,
   runCronNow,
+  saveModelsConfig,
   saveSettings,
   streamChat,
   uploadLibraryFiles,
@@ -31,6 +36,7 @@ import {
   type ConversationSummary,
   type CronJob,
   type LibraryNode,
+  type ModelsCatalog,
   type UploadedLibraryFile,
 } from "./api";
 
@@ -52,6 +58,7 @@ type Focus =
       size?: number;
       binary?: boolean;
       preview: string | null;
+      imageUrl?: string;
       loading?: boolean;
     }
   | {
@@ -69,6 +76,20 @@ function formatEvery(ms: number) {
   if (ms < 60000) return `${Math.round(ms / 1000)}s`;
   if (ms < 3600000) return `${Math.round(ms / 60000)}m`;
   return `${Math.round(ms / 3600000)}h`;
+}
+
+function collectDeliverables(nodes: LibraryNode[]): LibraryNode[] {
+  const out: LibraryNode[] = [];
+  const walk = (list: LibraryNode[]) => {
+    for (const node of list) {
+      if (node.type === "file" && node.path.startsWith("outputs/") && /\.(dxf|png|jpe?g|webp|gif|pdf|svg)$/i.test(node.name)) {
+        out.push(node);
+      }
+      if (node.children?.length) walk(node.children);
+    }
+  };
+  walk(nodes);
+  return out.sort((a, b) => (b.mtime || "").localeCompare(a.mtime || "")).slice(0, 8);
 }
 
 function LibraryTreeView({
@@ -100,7 +121,7 @@ function LibraryTreeView({
               <span>{n.name}</span>
             </button>
           ) : (
-            <details open={n.path === "mine"}>
+            <details open={n.path === "mine" || n.path === "outputs"}>
               <summary>
                 <span className="tree-mark">[D]</span>
                 {n.name}
@@ -189,7 +210,10 @@ function FocusPanel({
                 ? `二进制/过大文件 · ${focus.size ?? "?"} bytes`
                 : `预览 · ${focus.size ?? "?"} bytes`}
           </p>
-          <pre className="focus-body">{focus.preview || (focus.loading ? "…" : "(无文本预览)")}</pre>
+          {focus.kind === "file" && focus.imageUrl ? (
+            <img className="focus-preview" src={focus.imageUrl} alt={focus.path} />
+          ) : null}
+          <pre className="focus-body">{focus.preview || (focus.loading ? "…" : focus.imageUrl ? "" : "(无文本预览)")}</pre>
         </>
       )}
 
@@ -224,6 +248,212 @@ function FocusPanel({
   );
 }
 
+const MODEL_PRESETS = [
+  {
+    label: "阿里云 DashScope 视觉",
+    id: "dashscope",
+    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    modelId: "qwen3.6-flash",
+    modelName: "qwen3.6-flash（视觉）",
+    vision: true,
+  },
+  {
+    label: "OpenAI 兼容接口",
+    id: "openai",
+    baseUrl: "https://api.openai.com/v1",
+    modelId: "gpt-4.1",
+    modelName: "gpt-4.1",
+    vision: true,
+  },
+];
+
+function ModelsSettings({
+  settings,
+  catalog,
+  onReload,
+}: {
+  settings: AgentDeskSettings;
+  catalog: ModelsCatalog | null;
+  onReload: () => Promise<void>;
+}) {
+  const [id, setId] = useState("dashscope");
+  const [baseUrl, setBaseUrl] = useState("https://dashscope.aliyuncs.com/compatible-mode/v1");
+  const [modelId, setModelId] = useState("qwen3.6-flash");
+  const [modelName, setModelName] = useState("qwen3.6-flash（视觉）");
+  const [apiKey, setApiKey] = useState("");
+  const [vision, setVision] = useState(true);
+  const [setPrimary, setSetPrimary] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  function applyPreset(preset: (typeof MODEL_PRESETS)[number]) {
+    setId(preset.id);
+    setBaseUrl(preset.baseUrl);
+    setModelId(preset.modelId);
+    setModelName(preset.modelName);
+    setVision(preset.vision);
+    setErr(null);
+    setMsg(`已填入「${preset.label}」模板，补上 API Key 后保存。`);
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      await saveModelsConfig(settings, {
+        provider: {
+          id,
+          baseUrl,
+          modelId,
+          modelName,
+          apiKey: apiKey.trim() || undefined,
+          vision,
+          setPrimary,
+        },
+      });
+      setApiKey("");
+      setMsg("已写入 ~/.openclaw/openclaw.json。网关通常会热加载，请新开会话后再试。");
+      await onReload();
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function makePrimary(ref: string) {
+    setBusy(true);
+    setErr(null);
+    try {
+      await saveModelsConfig(settings, { primary: ref });
+      setMsg(`主模型已改为 ${ref}。请新开会话。`);
+      await onReload();
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="models-page">
+      <h1>配置 LLM 模型</h1>
+      <ol className="models-howto">
+        <li>
+          真正生效的文件是本机 <code>{catalog?.configPath || "~/.openclaw/openclaw.json"}</code>
+          。AgentDesk 设置页会写进这个文件。
+        </li>
+        <li>
+          需要三项：<strong>Base URL</strong>（不要带 <code>/chat/completions</code>）、
+          <strong>模型 id</strong>、<strong>API Key</strong>。看图任务必须勾选「支持图片」。
+        </li>
+        <li>
+          保存后网关会热加载。改模型后请点「新任务」，不要接着旧长对话跑。
+        </li>
+        <li>
+          也可以打开 OpenClaw Control UI：
+          <a href={catalog?.controlUi || "http://127.0.0.1:18789"} target="_blank" rel="noreferrer">
+            {catalog?.controlUi || "http://127.0.0.1:18789"}
+          </a>
+          （用左侧 Gateway Token 登录）。
+        </li>
+      </ol>
+
+      <p className="models-current">
+        当前主模型：<strong>{catalog?.primary || "（未读取）"}</strong>
+        {catalog?.fallbacks?.length ? ` · 回退 ${catalog.fallbacks.join(" → ")}` : ""}
+      </p>
+
+      <h2>已配置的提供商</h2>
+      {catalog?.providers?.length ? (
+        <ul className="models-providers">
+          {catalog.providers.map((p) => (
+            <li key={p.id}>
+              <div className="models-provider-head">
+                <strong>{p.id}</strong>
+                <span>{p.baseUrl}</span>
+                <span>{p.apiKeySet ? `Key ${p.apiKeyHint}` : "未填 Key"}</span>
+              </div>
+              <ul>
+                {p.models.map((m) => (
+                  <li key={m.ref}>
+                    <code>{m.ref}</code>
+                    {m.vision ? " · 视觉" : " · 仅文本"}
+                    {catalog.primary === m.ref ? " · 主模型" : null}
+                    {catalog.primary === m.ref ? null : (
+                      <button type="button" className="ghost" disabled={busy} onClick={() => void makePrimary(m.ref)}>
+                        设为主模型
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="hint">还没有提供商。用下面的模板添加。</p>
+      )}
+
+      <h2>添加 / 更新提供商</h2>
+      <div className="models-presets">
+        {MODEL_PRESETS.map((preset) => (
+          <button key={preset.id} type="button" className="ghost" onClick={() => applyPreset(preset)}>
+            {preset.label}
+          </button>
+        ))}
+      </div>
+      <div className="field">
+        <label>提供商 id（写入 models.providers.&lt;id&gt;）</label>
+        <input value={id} onChange={(e) => setId(e.target.value)} placeholder="dashscope" />
+      </div>
+      <div className="field">
+        <label>Base URL</label>
+        <input
+          value={baseUrl}
+          onChange={(e) => setBaseUrl(e.target.value)}
+          placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"
+        />
+      </div>
+      <div className="field">
+        <label>模型 id</label>
+        <input value={modelId} onChange={(e) => setModelId(e.target.value)} placeholder="qwen3.6-flash" />
+      </div>
+      <div className="field">
+        <label>显示名（可选）</label>
+        <input value={modelName} onChange={(e) => setModelName(e.target.value)} />
+      </div>
+      <div className="field">
+        <label>API Key（已有 Key 可留空不改）</label>
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          placeholder="sk-…"
+          autoComplete="off"
+        />
+      </div>
+      <label className="models-check">
+        <input type="checkbox" checked={vision} onChange={(e) => setVision(e.target.checked)} />
+        支持图片（看图 / CAD 从图纸生成必须勾选）
+      </label>
+      <label className="models-check">
+        <input type="checkbox" checked={setPrimary} onChange={(e) => setSetPrimary(e.target.checked)} />
+        保存后设为主模型
+      </label>
+      <div className="row">
+        <button type="button" className="models-save" disabled={busy} onClick={() => void save()}>
+          {busy ? "保存中…" : "保存到 openclaw.json"}
+        </button>
+      </div>
+      {msg ? <p className="hint">{msg}</p> : null}
+      {err ? <p className="models-err">{err}</p> : null}
+    </div>
+  );
+}
+
 export default function App() {
   const [settings, setSettings] = useState<AgentDeskSettings>(() => loadSettings());
   const [tab, setTab] = useState<Tab>("chats");
@@ -231,7 +461,7 @@ export default function App() {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [statusHint, setStatusHint] = useState<string | null>(null);
-  const [activity, setActivity] = useState<Array<{ id: string; at: string; text: string }>>([]);
+  const [activity, setActivity] = useState<Array<{ id: string; at: string; text: string; detail?: string }>>([]);
   const [elapsedSec, setElapsedSec] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const busySinceRef = useRef<number>(0);
@@ -242,6 +472,7 @@ export default function App() {
   const [gatewayDetail, setGatewayDetail] = useState("未探测");
   const [bridgeDetail, setBridgeDetail] = useState("未探测");
   const [error, setError] = useState<string | null>(null);
+  const [pinnedSkill, setPinnedSkill] = useState<string | null>(null);
   const [pendingFiles, setPendingFiles] = useState<UploadedLibraryFile[]>([]);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -262,6 +493,7 @@ export default function App() {
   const [cronEveryMin, setCronEveryMin] = useState(60);
   const [sessions, setSessions] = useState<WbSession[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
+  const [modelCatalog, setModelCatalog] = useState<ModelsCatalog | null>(null);
 
   useEffect(() => {
     saveSettings(settings);
@@ -296,6 +528,14 @@ export default function App() {
     const b = await probeBridge(settings);
     setBridgeOk(b.ok);
     setBridgeDetail(b.detail);
+  }
+
+  async function refreshModels() {
+    try {
+      setModelCatalog(await fetchModelsConfig(settings));
+    } catch {
+      /* bridge may be down */
+    }
   }
 
   async function refreshLibrary() {
@@ -338,6 +578,7 @@ export default function App() {
     } catch {
       /* ignore */
     }
+    await refreshModels();
   }
 
   useEffect(() => {
@@ -388,6 +629,7 @@ export default function App() {
     () => (draft.trim().length > 0 || pendingFiles.length > 0) && !busy && !uploading,
     [draft, busy, pendingFiles.length, uploading],
   );
+  const deliverables = useMemo(() => collectDeliverables(tree), [tree]);
 
   function toggleFile(path: string, type: string) {
     if (type !== "file") return;
@@ -401,7 +643,8 @@ export default function App() {
 
   async function openFile(path: string, type: string) {
     if (type !== "file") return;
-    setFocus({ kind: "file", path, preview: null, loading: true });
+    const imageUrl = /\.(png|jpe?g|webp|gif)$/i.test(path) ? libraryRawUrl(settings, path) : undefined;
+    setFocus({ kind: "file", path, preview: null, imageUrl, loading: true });
     try {
       const data = await fetchLibraryFile(settings, path);
       setFocus({
@@ -410,6 +653,7 @@ export default function App() {
         size: data.size,
         binary: data.binary,
         preview: data.preview,
+        imageUrl,
         loading: false,
       });
     } catch (e) {
@@ -417,6 +661,7 @@ export default function App() {
         kind: "file",
         path,
         preview: String(e instanceof Error ? e.message : e),
+        imageUrl,
         loading: false,
       });
     }
@@ -443,10 +688,18 @@ export default function App() {
     }
   }
 
-  function useFocusedSkill() {
+  async function useFocusedSkill() {
     if (!focus || focus.kind !== "skill") return;
-    const snippet = `请使用 Skill「${focus.name}」完成任务。\n\n（Skill 说明已在工作区 skills/${focus.name}/SKILL.md）`;
-    setDraft((d) => (d ? `${snippet}\n\n${d}` : snippet));
+    setPinnedSkill(focus.name);
+    setError(null);
+    try {
+      const contract = await fetchSkillContract(settings, focus.name);
+      const snippet = contract.snippet || `请使用 Skill「${focus.name}」完成任务。`;
+      setDraft((d) => (d.includes(`[WorkBuddy Skill 合同]`) ? d : d ? `${snippet}\n\n${d}` : snippet));
+      setTab("chats");
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    }
   }
 
   async function attachPaths(paths: string[]) {
@@ -495,24 +748,43 @@ export default function App() {
     }
   }
 
-  function pushActivity(text: string) {
+  function pushActivity(text: string, detail?: string) {
     const trimmed = text.trim();
     if (!trimmed) return;
+    const extra = String(detail || "").trim();
     setActivity((prev) => {
-      if (prev[prev.length - 1]?.text === trimmed) return prev;
+      const last = prev[prev.length - 1];
+      if (last?.text === trimmed && (last.detail || "") === extra) return prev;
       const at = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-      return [...prev, { id: `${Date.now()}-${prev.length}`, at, text: trimmed }].slice(-16);
+      return [...prev, { id: `${Date.now()}-${prev.length}`, at, text: trimmed, detail: extra || undefined }].slice(-40);
     });
-    setStatusHint(trimmed);
+    setStatusHint(trimmed.split("\n")[0].slice(0, 96));
   }
 
   useEffect(() => {
-    if (!busy && !uploading) return;
+    if (!busy) return;
     const timer = window.setInterval(() => {
       setElapsedSec(Math.max(0, Math.round((Date.now() - busySinceRef.current) / 1000)));
     }, 1000);
     return () => window.clearInterval(timer);
   }, [busy, uploading]);
+
+  useEffect(() => {
+    let stop = false;
+    const pull = async () => {
+      try {
+        const data = await fetchLibraryTree(settings);
+        if (!stop) setTree(data.tree || []);
+      } catch {
+        /* library poll is best-effort */
+      }
+    };
+    const timer = window.setInterval(() => void pull(), busy ? 2500 : 8000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [busy, settings]);
 
   useEffect(() => {
     if (!busy) return;
@@ -527,19 +799,48 @@ export default function App() {
         for (const line of data.lines || []) {
           if (!line?.text || seenActivityRef.current.has(line.key)) continue;
           seenActivityRef.current.add(line.key);
-          pushActivity(line.text);
+          pushActivity(line.text, line.detail);
         }
       } catch {
         /* activity feed is best-effort */
       }
     };
     void pull();
-    const timer = window.setInterval(() => void pull(), 2000);
+    const timer = window.setInterval(() => void pull(), 1200);
     return () => {
       stop = true;
       window.clearInterval(timer);
     };
     // pull uses latest settings captured when busy starts
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy]);
+
+  useEffect(() => {
+    if (busy) return;
+    if (!activitySinceRef.current) return;
+    let stop = false;
+    const pull = async () => {
+      try {
+        const data = await fetchRuntimeActivity(
+          settings,
+          activitySinceRef.current || new Date().toISOString(),
+        );
+        if (stop) return;
+        for (const line of data.lines || []) {
+          if (!line?.text || seenActivityRef.current.has(line.key)) continue;
+          seenActivityRef.current.add(line.key);
+          pushActivity(line.text, line.detail);
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+    void pull();
+    const timer = window.setTimeout(() => void pull(), 1600);
+    return () => {
+      stop = true;
+      window.clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy]);
 
@@ -588,6 +889,8 @@ export default function App() {
     if (busy || uploading) return;
     let content = draft.trim();
     const attachPathsList = pendingFiles.map((f) => f.path);
+    const skillMatch = /技能「([^」]+)」|Skill「([^」]+)」|\[WorkBuddy Skill 合同\].*技能「([^」]+)」/.exec(content);
+    const skillName = pinnedSkill || skillMatch?.[1] || skillMatch?.[2] || skillMatch?.[3] || "";
     const restoreDraft = draft;
     const restorePending = pendingFiles;
     if (!content && !attachPathsList.length) return;
@@ -605,7 +908,12 @@ export default function App() {
     if (attachPathsList.length) {
       pushActivity(`正在把 ${attachPathsList.length} 个附件挂到任务…`);
       try {
-        const { snippet } = await attachLibrary(settings, attachPathsList);
+        const includeSkill = Boolean(skillName) && !content.includes("[WorkBuddy Skill 合同]");
+        const { snippet } = await attachLibrary(
+          settings,
+          attachPathsList,
+          includeSkill ? skillName : undefined,
+        );
         await createTask(
           settings,
           `任务 · ${attachPathsList[0]}`,
@@ -622,6 +930,26 @@ export default function App() {
         setBusy(false);
         setStatusHint(null);
         return;
+      }
+    }
+
+    if (!content.includes("[WorkBuddy Skill 合同]")) {
+      try {
+        const matched = await matchSkillContract(settings, content, skillName || undefined);
+        if (matched.matched && matched.snippet) {
+          content = content ? `${matched.snippet}\n\n${content}` : matched.snippet;
+          if (matched.name) setPinnedSkill(matched.name);
+          pushActivity(`已套用 WorkBuddy 技能合同：${matched.name}`);
+        }
+      } catch (e) {
+        if (skillName) {
+          setError(String(e instanceof Error ? e.message : e));
+          setDraft(restoreDraft);
+          setPendingFiles(restorePending);
+          setBusy(false);
+          setStatusHint(null);
+          return;
+        }
       }
     }
 
@@ -729,6 +1057,7 @@ export default function App() {
     setMessages([]);
     setSelected(new Set());
     setPendingFiles([]);
+    setPinnedSkill(null);
     setFocus(null);
     setError(null);
     setTab("chats");
@@ -748,7 +1077,9 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">AgentDesk</div>
-          <div className="brand-sub">P1 资料库 · P2 任务流</div>
+          <div className="brand-sub">
+            {modelCatalog?.primary ? `主模型 ${modelCatalog.primary}` : "P1 资料库 · P2 任务流"}
+          </div>
         </div>
         <div className="status-group">
           <div className="status">
@@ -1086,6 +1417,8 @@ export default function App() {
                   Gateway: {gatewayDetail}
                   <br />
                   Bridge: {bridgeDetail}
+                  <br />
+                  模型清单和 API Key 在右侧配置。
                 </p>
               </section>
             )}
@@ -1111,6 +1444,10 @@ export default function App() {
             isSelected={focusFileSelected}
           />
 
+          {tab === "settings" ? (
+            <ModelsSettings settings={settings} catalog={modelCatalog} onReload={refreshModels} />
+          ) : (
+            <>
           <div className="messages">
             {messages.length === 0 ? (
               <div className="empty">
@@ -1133,35 +1470,92 @@ export default function App() {
             {error ? <div className="bubble error">{error}</div> : null}
           </div>
 
+          {deliverables.length > 0 ? (
+            <div className="deliverables">
+              <div className="deliverables-title">产物</div>
+              <div className="deliverables-row">
+                {deliverables.map((file) => {
+                  const image = /\.(png|jpe?g|webp|gif)$/i.test(file.name);
+                  return (
+                    <button
+                      key={file.path}
+                      type="button"
+                      className="deliverable"
+                      title={file.path}
+                      onClick={() => void openFile(file.path, "file")}
+                    >
+                      {image ? (
+                        <img src={libraryRawUrl(settings, file.path)} alt="" />
+                      ) : (
+                        <span className="deliverable-ext">{file.name.split(".").pop()?.toUpperCase()}</span>
+                      )}
+                      <span className="deliverable-name">{file.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : null}
+
           {dragOver ? (
             <div className="main-drop-hint">松开以上传并附加到任务</div>
           ) : null}
 
           <div className={`composer ${dragOver ? "dragover" : ""}`}>
-            {(busy || uploading) && (
+            {(busy || uploading || activity.length > 0) && (
               <div className="activity-bar" role="status" aria-live="polite">
                 <div className="activity-head">
-                  <span className="activity-dot" />
-                  <strong>{statusHint || (uploading ? "正在上传…" : "正在处理…")}</strong>
-                  <span className="activity-time">{elapsedSec}s</span>
-                  <button type="button" className="activity-cancel" onClick={onCancel}>
-                    取消
-                  </button>
+                  {busy || uploading ? <span className="activity-dot" /> : null}
+                  <strong>
+                    {busy || uploading
+                      ? statusHint || (uploading ? "正在上传…" : "正在处理…")
+                      : "本轮请求 / 回复（调试）"}
+                  </strong>
+                  {(busy || uploading) && <span className="activity-time">{elapsedSec}s</span>}
+                  {busy || uploading ? (
+                    <button type="button" className="activity-cancel" onClick={onCancel}>
+                      取消
+                    </button>
+                  ) : (
+                    <button type="button" className="activity-cancel" onClick={() => setActivity([])}>
+                      关闭
+                    </button>
+                  )}
                 </div>
                 {activity.length > 0 ? (
                   <ol className="activity-log">
-                    {activity.map((line) => (
+                    {activity.map((line, idx) => (
                       <li key={line.id}>
                         <time>{line.at}</time>
-                        <span>{line.text}</span>
+                        {line.detail ? (
+                          <details open={idx >= activity.length - 2}>
+                            <summary>{line.text}</summary>
+                            <pre>{line.detail}</pre>
+                          </details>
+                        ) : (
+                          <span>{line.text}</span>
+                        )}
                       </li>
                     ))}
                   </ol>
                 ) : null}
               </div>
             )}
-            {pendingFiles.length > 0 ? (
+            {pendingFiles.length > 0 || pinnedSkill ? (
               <div className="composer-attachments">
+                {pinnedSkill ? (
+                  <span className="attach-chip" title="本次发送会按 WorkBuddy 技能合同执行">
+                    <span className="attach-chip-name">Skill {pinnedSkill}</span>
+                    <button
+                      type="button"
+                      className="attach-chip-x"
+                      aria-label="取消技能"
+                      onClick={() => setPinnedSkill(null)}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ) : null}
                 {pendingFiles.map((f) => (
                   <span key={f.path} className="attach-chip" title={f.path}>
                     <span className="attach-chip-name">{f.name}</span>
@@ -1230,6 +1624,8 @@ export default function App() {
               ) : null}
             </div>
           </div>
+            </>
+          )}
         </main>
       </div>
     </div>

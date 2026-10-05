@@ -313,6 +313,180 @@ function importAllWorkBuddy() {
   return results;
 }
 
+function skillHash(file) {
+  try {
+    return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 12);
+  } catch {
+    return "";
+  }
+}
+
+function syncWorkBuddySkills() {
+  const destRoot = path.join(WORKSPACE, "skills");
+  fs.mkdirSync(destRoot, { recursive: true });
+  const synced = [];
+  if (!fs.existsSync(WB_SKILLS)) return synced;
+  for (const name of fs.readdirSync(WB_SKILLS)) {
+    const src = path.join(WB_SKILLS, name);
+    const skillMd = path.join(src, "SKILL.md");
+    if (!fs.existsSync(skillMd) || !fs.statSync(src).isDirectory()) continue;
+    const dest = path.join(destRoot, name);
+    const destMd = path.join(dest, "SKILL.md");
+    if (fs.existsSync(destMd) && skillHash(skillMd) === skillHash(destMd)) {
+      synced.push({ name, action: "same" });
+      continue;
+    }
+    fs.cpSync(src, dest, { recursive: true, force: true });
+    synced.push({ name, action: "copied" });
+    audit("skills.sync_workbuddy", { name });
+  }
+  return synced;
+}
+
+function resolveSkill(name) {
+  const safe = String(name || "").trim();
+  if (!safe || /[\\/]|\.\./.test(safe)) return null;
+  const wbDir = path.join(WB_SKILLS, safe);
+  const ocDir = path.join(WORKSPACE, "skills", safe);
+  const dir = fs.existsSync(path.join(wbDir, "SKILL.md"))
+    ? wbDir
+    : fs.existsSync(path.join(ocDir, "SKILL.md"))
+      ? ocDir
+      : null;
+  if (!dir) return null;
+  return {
+    name: safe,
+    dir,
+    source: dir === wbDir ? "workbuddy-user" : "openclaw-workspace",
+    skillMd: path.join(dir, "SKILL.md"),
+  };
+}
+
+function listSkillFiles(dir, prefix = "") {
+  const out = [];
+  if (!fs.existsSync(dir)) return out;
+  for (const name of fs.readdirSync(dir)) {
+    if (name === "node_modules" || name.startsWith(".")) continue;
+    const abs = path.join(dir, name);
+    const rel = prefix ? `${prefix}/${name}` : name;
+    const st = fs.statSync(abs);
+    if (st.isDirectory()) out.push(...listSkillFiles(abs, rel));
+    else out.push(rel.replace(/\\/g, "/"));
+  }
+  return out;
+}
+
+function workbuddyPython(skillBody = "") {
+  const mentioned = String(skillBody).match(/[A-Za-z]:[\\/](?:[^\\/\s`]+[\\/])*python\.exe/i);
+  if (mentioned) {
+    const abs = mentioned[0].replace(/\//g, "\\");
+    if (fs.existsSync(abs)) return abs.replace(/\\/g, "/");
+  }
+  const versions = path.join(HOME, ".workbuddy", "binaries", "python", "versions");
+  if (!fs.existsSync(versions)) return "";
+  const exes = fs
+    .readdirSync(versions)
+    .map((version) => path.join(versions, version, "python.exe"))
+    .filter((exe) => fs.existsSync(exe))
+    .sort();
+  return exes.length ? exes[exes.length - 1].replace(/\\/g, "/") : "";
+}
+
+function listSkillNames() {
+  const names = new Set();
+  for (const root of [WB_SKILLS, path.join(WORKSPACE, "skills")]) {
+    if (!fs.existsSync(root)) continue;
+    for (const name of fs.readdirSync(root)) {
+      if (fs.existsSync(path.join(root, name, "SKILL.md"))) names.add(name);
+    }
+  }
+  return [...names];
+}
+
+function skillTriggerPhrases(description) {
+  const phrases = [];
+  const re = /[「"“']([^」"”']{2,40})[」"”']/g;
+  let match;
+  while ((match = re.exec(description))) phrases.push(match[1]);
+  return phrases;
+}
+
+function matchWorkBuddySkill(text, preferred) {
+  syncWorkBuddySkills();
+  const preferredName = String(preferred || "").trim();
+  if (preferredName && resolveSkill(preferredName)) return buildSkillContract(preferredName);
+  const raw = String(text || "");
+  if (!raw.trim()) return null;
+  let bestName = "";
+  let bestScore = 0;
+  let ties = 0;
+  for (const name of listSkillNames()) {
+    const skill = resolveSkill(name);
+    if (!skill) continue;
+    let score = raw.includes(name) ? 100 : 0;
+    let body = "";
+    try {
+      body = fs.readFileSync(skill.skillMd, "utf8");
+    } catch {
+      continue;
+    }
+    const front = /^---\r?\n([\s\S]*?)\r?\n---/.exec(body);
+    const description = front ? /^description:\s*(.+)$/m.exec(front[1])?.[1] || "" : "";
+    for (const phrase of skillTriggerPhrases(description)) {
+      if (raw.includes(phrase)) score = Math.max(score, 90);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestName = name;
+      ties = 1;
+    } else if (score === bestScore && score > 0) {
+      ties += 1;
+    }
+  }
+  if (bestScore < 90 || !bestName || ties > 1) return null;
+  return buildSkillContract(bestName);
+}
+
+function buildSkillContract(name) {
+  syncWorkBuddySkills();
+  const skill = resolveSkill(name);
+  if (!skill) return null;
+  const body = fs.readFileSync(skill.skillMd, "utf8");
+  const files = listSkillFiles(skill.dir);
+  const templates = files.filter((f) => /assets\/.+\.(py|js|mjs|ps1|sh)$/i.test(f));
+  const py = workbuddyPython(body);
+  const lines = [
+    `[WorkBuddy Skill 合同] 必须按技能「${skill.name}」原文执行，目标是与 WorkBuddy 同一技能得到同类产物。`,
+    "",
+    "硬性规则：",
+    "1. 先 Read 本技能 SKILL.md，再 Read 下面列出的模板脚本。禁止在未读模板前从零编写依赖库代码。",
+    "2. 生成脚本时以模板为起点复制修改（改输入路径、尺寸参数、输出文件名）。禁止发明模板里没有的 API。",
+    "3. 产物必须写入 library/outputs/，文件名与技能交付标准一致，并在回复里给出绝对路径。",
+    "4. 技能要求的文件（如 DXF、PNG）没落盘之前，不要用纯文字分析结束任务。",
+  ];
+  if (py) {
+    lines.push(`5. 运行 Python 必须使用：\`${py}\`。不要用 PATH 里别的 python。`);
+  }
+  lines.push(
+    "",
+    `技能目录：\`${skill.dir.replace(/\\/g, "/")}\``,
+    "技能文件：",
+    ...files.map((f) => `- \`${f}\``),
+  );
+  if (templates.length) {
+    lines.push("", "必须先读取并作为唯一起点的模板：", ...templates.map((f) => `- \`${skill.dir.replace(/\\/g, "/")}/${f}\``));
+  }
+  lines.push("", "----- SKILL.md -----", body.trim().slice(0, 12000));
+  return {
+    name: skill.name,
+    source: skill.source,
+    dir: skill.dir,
+    files,
+    python: py,
+    snippet: lines.join("\n"),
+  };
+}
+
 function listSkillsCompat() {
   const wb = [];
   const oc = [];
@@ -450,31 +624,408 @@ function startCronLoop() {
   }, 15000);
 }
 
-function describeGatewayMessage(msg) {
-  const text = String(msg || "");
+function stripAnsi(text) {
+  return String(text || "").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function extractToolName(text) {
+  const fromRaw = /raw_params=[\s\S]*"id"\s*:\s*"([a-zA-Z][a-zA-Z0-9_.:\-]{1,60})"/.exec(text)?.[1];
+  const fromToolField =
+    /"tool(?:Name|Id)"\s*:\s*"([a-zA-Z][a-zA-Z0-9_.:\-]{1,60})"/.exec(text)?.[1] ||
+    /\btool(?:_call)?(?:\s+failed)?[:\s]+`?([a-zA-Z][a-zA-Z0-9_.:\-]{1,40})`?/.exec(text)?.[1] ||
+    /\b(?:calling|invoke(?:d)?|running)\s+tool\s+[`"']?([a-zA-Z][a-zA-Z0-9_.:\-]{1,40})/.exec(text)?.[1];
+  const raw = fromRaw || fromToolField;
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (["failed", "error", "call", "search", "cataloged", "args", "query"].includes(lower)) return null;
+  return raw;
+}
+
+function shortPath(p) {
+  const s = String(p || "").replace(/\\/g, "/");
+  if (!s) return "";
+  const parts = s.split("/").filter(Boolean);
+  if (parts.length <= 2) return parts.join("/") || s;
+  return parts.slice(-2).join("/");
+}
+
+function clipText(s, n = 72) {
+  const t = String(s || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!t) return "";
+  return t.length > n ? `${t.slice(0, n)}…` : t;
+}
+
+function clipBlock(s, n = 4000) {
+  const t = String(s || "");
+  if (!t) return "";
+  if (t.length <= n) return t;
+  return `${t.slice(0, n)}\n…(已截断 ${t.length - n} 字)`;
+}
+
+function extractContentParts(content) {
+  const parts = { thinking: "", text: "", tools: [] };
+  const walk = (node) => {
+    if (node == null) return;
+    if (typeof node === "string") {
+      parts.text += node;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const x of node) walk(x);
+      return;
+    }
+    if (typeof node !== "object") return;
+    const type = node.type || node.kind;
+    if (type === "thinking" || type === "reasoning") {
+      parts.thinking += node.thinking || node.text || node.content || "";
+      return;
+    }
+    if (type === "text") {
+      parts.text += typeof node.text === "string" ? node.text : node.content || "";
+      return;
+    }
+    if (type === "toolCall" || type === "tool_use") {
+      parts.tools.push({
+        name: node.name || node.toolName || "tool",
+        args: node.arguments || node.args || node.input || {},
+      });
+      return;
+    }
+    if (node.content) walk(node.content);
+  };
+  walk(content);
+  return parts;
+}
+
+function stringifyArgs(args) {
+  if (args == null) return "";
+  if (typeof args === "string") return args;
+  try {
+    return JSON.stringify(args, null, 2);
+  } catch {
+    return String(args);
+  }
+}
+
+function formatIoDetail({ heading, thinking, text, tools, extra } = {}) {
+  const blocks = [];
+  if (heading) blocks.push(heading);
+  if (String(thinking || "").trim()) blocks.push(`【思考】\n${clipBlock(thinking, 2500)}`);
+  if (String(text || "").trim()) blocks.push(`【正文】\n${clipBlock(text, 3000)}`);
+  for (const tool of tools || []) {
+    const name = tool?.name || "tool";
+    blocks.push(`【调用 ${name}】\n${clipBlock(stringifyArgs(tool.args), 3500)}`);
+  }
+  if (String(extra || "").trim()) blocks.push(String(extra).trim());
+  return blocks.join("\n\n").trim();
+}
+
+function toolResultText(result) {
+  if (result == null) return "";
+  if (typeof result === "string") return result;
+  const chunks = [];
+  if (Array.isArray(result.content)) {
+    for (const part of result.content) {
+      if (typeof part === "string") chunks.push(part);
+      else if (part && typeof part.text === "string") chunks.push(part.text);
+    }
+  }
+  if (result.details?.aggregated) chunks.push(String(result.details.aggregated));
+  if (chunks.length) return chunks.join("\n");
+  try {
+    return JSON.stringify(result, null, 2);
+  } catch {
+    return String(result);
+  }
+}
+
+function activityAt(ev, createdAt) {
+  if (typeof ev?.ts === "string" && ev.ts) return ev.ts;
+  if (Number.isFinite(createdAt)) return new Date(createdAt).toISOString();
+  return "";
+}
+
+function summarizeToolArgs(name, args) {
+  if (!args || typeof args !== "object") return "";
+  if (typeof args.title === "string" && args.title.trim()) return clipText(args.title, 64);
+  if (typeof args.path === "string") return shortPath(args.path);
+  if (typeof args.file_path === "string") return shortPath(args.file_path);
+  if (typeof args.command === "string") return clipText(args.command, 88);
+  if (typeof args.query === "string") return clipText(args.query, 72);
+  if (typeof args.url === "string") return clipText(args.url, 72);
+  if (typeof args.pattern === "string") return clipText(args.pattern, 64);
+  if (name === "web_search" || name === "bocha_web_search") {
+    return clipText(args.q || args.keyword || args.search || "", 72);
+  }
+  const keys = Object.keys(args).slice(0, 3);
+  if (!keys.length) return "";
+  try {
+    return clipText(JSON.stringify(Object.fromEntries(keys.map((k) => [k, args[k]]))), 88);
+  } catch {
+    return "";
+  }
+}
+
+function describeTrajectoryEvent(ev) {
+  if (!ev || typeof ev !== "object") return null;
+  const d = ev.data && typeof ev.data === "object" ? ev.data : {};
+  const model = String(ev.modelId || "").trim();
+  const type = String(ev.type || "");
+
+  if (type === "prompt.submitted") {
+    const prompt = String(d.prompt || "").trim();
+    const msgs = Array.isArray(d.messages) ? d.messages : [];
+    const msgBlocks = msgs.slice(-6).map((m) => {
+      const p = extractContentParts(m?.content ?? m);
+      const body = [p.thinking, p.text].filter((x) => String(x).trim()).join("\n");
+      return `【${m?.role || "message"}】\n${clipBlock(body || stringifyArgs(m), 1600)}`;
+    });
+    const extra = msgBlocks.join("\n\n");
+    const detail = formatIoDetail({
+      heading: model ? `发给 ${model}` : "发给模型",
+      text: prompt,
+      extra,
+    });
+    const preview = clipText(prompt, 70);
+    return {
+      text: preview ? `发给模型${model ? ` ${model}` : ""}：${preview}` : `发给模型${model ? ` ${model}` : ""}`,
+      detail: detail || prompt,
+    };
+  }
+
+  if (type === "tool.call") {
+    const name = String(d.name || "tool").trim() || "tool";
+    const summary = summarizeToolArgs(name, d.args);
+    return {
+      text: summary ? `模型回复 · 调用 ${name}：${summary}` : `模型回复 · 调用 ${name}`,
+      detail: formatIoDetail({ tools: [{ name, args: d.args }] }),
+    };
+  }
+
+  if (type === "tool.result") {
+    const name = String(d.name || "tool").trim() || "tool";
+    const body = toolResultText(d.result);
+    return {
+      text: d.success === false ? `工具 ${name} 失败` : `工具 ${name} 已回传`,
+      detail: clipBlock(body, 2500),
+    };
+  }
+
+  if (type === "model.completed") {
+    const snap = Array.isArray(d.messagesSnapshot) ? d.messagesSnapshot : [];
+    const lastAsst = [...snap].reverse().find((m) => m?.role === "assistant");
+    const parts = extractContentParts(lastAsst?.content);
+    if (Array.isArray(d.assistantTexts) && d.assistantTexts.length && !String(parts.text).trim()) {
+      parts.text = d.assistantTexts.filter(Boolean).join("\n");
+    }
+    const err = d.promptError ? `【中断】${d.promptError}` : "";
+    const usage = d.usage
+      ? `【用量】in ${d.usage.input ?? "?"} / out ${d.usage.output ?? "?"} / total ${d.usage.total ?? "?"}`
+      : "";
+    const detail = formatIoDetail({
+      heading: model ? `来自 ${model}` : "模型回复",
+      thinking: parts.thinking,
+      text: parts.text,
+      tools: parts.tools,
+      extra: [err, usage].filter(Boolean).join("\n"),
+    });
+    if (d.promptError) {
+      return { text: `模型中断：${clipText(d.promptError, 100)}`, detail };
+    }
+    const input = d.usage?.input;
+    const output = d.usage?.output;
+    const preview = clipText(parts.text || parts.thinking, 70);
+    return {
+      text: preview
+        ? `模型回复：${preview}`
+        : Number.isFinite(Number(input))
+          ? `模型回复收束 · ${input}→${Number.isFinite(Number(output)) ? output : 0} tokens`
+          : "模型回复收束",
+      detail,
+    };
+  }
+
+  if (type === "session.ended") return { text: "本轮 Agent 运行已结束", detail: "" };
+  return null;
+}
+
+function latestTrajectoryActivity(sinceMs) {
+  const dbPath = path.join(OPENCLAW, "agents", "main", "agent", "openclaw-agent.sqlite");
+  if (!fs.existsSync(dbPath)) return [];
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    return [];
+  }
+  try {
+    const floor = Number.isFinite(sinceMs) ? Math.max(0, sinceMs - 1500) : Date.now() - 120_000;
+    const rows = db
+      .prepare(
+        `SELECT created_at, event_json
+         FROM trajectory_runtime_events
+         WHERE created_at >= ?
+           AND (
+             instr(event_json, '"type":"tool.call"') > 0
+             OR instr(event_json, '"type":"tool.result"') > 0
+             OR instr(event_json, '"type":"prompt.submitted"') > 0
+             OR instr(event_json, '"type":"model.completed"') > 0
+             OR instr(event_json, '"type":"session.ended"') > 0
+           )
+         ORDER BY created_at ASC
+         LIMIT 160`,
+      )
+      .all(floor);
+    const items = [];
+    for (const row of rows) {
+      let ev;
+      try {
+        ev = JSON.parse(row.event_json);
+      } catch {
+        continue;
+      }
+      const described = describeTrajectoryEvent(ev);
+      if (!described?.text) continue;
+      const at = activityAt(ev, row.created_at);
+      if (!at) continue;
+      const atMs = Date.parse(at);
+      if (Number.isFinite(sinceMs) && Number.isFinite(atMs) && atMs + 1000 < sinceMs) continue;
+      items.push({
+        at,
+        text: described.text,
+        detail: described.detail || "",
+        key: `traj|${row.created_at}|${ev.type}|${described.text}`,
+      });
+    }
+    return items;
+  } catch {
+    return [];
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function latestTranscriptActivity(sinceMs) {
+  const dbPath = path.join(OPENCLAW, "agents", "main", "agent", "openclaw-agent.sqlite");
+  if (!fs.existsSync(dbPath)) return [];
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true });
+  } catch {
+    return [];
+  }
+  try {
+    const floor = Number.isFinite(sinceMs) ? Math.max(0, sinceMs - 1500) : Date.now() - 120_000;
+    const rows = db
+      .prepare(
+        `SELECT session_id, seq, created_at, event_json
+         FROM transcript_events
+         WHERE created_at >= ?
+           AND event_json IS NOT NULL
+           AND instr(event_json, '"role":"assistant"') > 0
+         ORDER BY created_at ASC
+         LIMIT 80`,
+      )
+      .all(floor);
+    const items = [];
+    for (const row of rows) {
+      let ev;
+      try {
+        ev = JSON.parse(row.event_json);
+      } catch {
+        continue;
+      }
+      const msg = ev?.message;
+      if (!msg || msg.role !== "assistant") continue;
+      const parts = extractContentParts(msg.content);
+      if (!String(parts.thinking).trim() && !String(parts.text).trim() && !parts.tools.length) continue;
+      const at = typeof ev.timestamp === "string" && ev.timestamp ? ev.timestamp : activityAt(ev, row.created_at);
+      const atMs = Date.parse(at);
+      if (Number.isFinite(sinceMs) && Number.isFinite(atMs) && atMs + 1000 < sinceMs) continue;
+      const preview = clipText(parts.text || parts.thinking || parts.tools.map((t) => t.name).join(", "), 70);
+      const model = msg.model || msg.provider ? `${msg.provider || ""} ${msg.model || ""}`.trim() : "";
+      items.push({
+        at,
+        text: preview ? `模型回复：${preview}` : "模型回复",
+        detail: formatIoDetail({
+          heading: model ? `来自 ${model}` : "模型回复",
+          thinking: parts.thinking,
+          text: parts.text,
+          tools: parts.tools,
+        }),
+        key: `trans|${row.session_id}|${row.seq}`,
+      });
+    }
+    return items;
+  } catch {
+    return [];
+  } finally {
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function describeGatewayMessage(msg, ctx = {}) {
+  const text = stripAnsi(msg);
   if (!text) return null;
+
+  const tool = extractToolName(text);
+  if (tool && /tool_call failed|tool failed|failed:/.test(text)) {
+    return `工具调用失败：${tool}`;
+  }
+  if (tool && /web_search is disabled|no provider is available/i.test(text)) {
+    return `工具 ${tool} 不可用（未配置搜索 Provider）`;
+  }
+  if (tool) return `正在调用工具 ${tool}`;
+
   if (text.includes("[model-fetch] response")) {
-    const model = /model=(\S+)/.exec(text)?.[1] || "模型";
-    const ms = /elapsedMs=(\d+)/.exec(text)?.[1];
-    return `正在请求模型 ${model}${ms ? `（本段 ${ms}ms）` : ""}`;
+    return null;
   }
   if (text.includes("[model-fetch] error")) {
     const message = /message=(.+)$/.exec(text)?.[1] || "模型请求失败";
     return `模型请求失败：${message}`;
   }
+  if (/transient same-model retry/i.test(text)) {
+    const n = /retry\s+(\d+\/\d+)/i.exec(text)?.[1];
+    const reason = /reason=([^\s:]+)/i.exec(text)?.[1];
+    return `模型瞬时失败，正在重试${n ? ` ${n}` : ""}${reason ? `（${reason}）` : ""}`;
+  }
+  if (/context-pressure|estimatedPromptTokens=(\d+)/.test(text)) {
+    const tokens = /estimatedPromptTokens=(\d+)/.exec(text)?.[1];
+    const budget = /promptBudgetBeforeReserve=(\d+)/.exec(text)?.[1];
+    if (tokens && budget && Number(tokens) > Number(budget)) {
+      return `上下文过长（约 ${tokens} tokens > 预算 ${budget}），正在压缩后继续`;
+    }
+    if (tokens) return `正在评估上下文压力（约 ${tokens} tokens）`;
+  }
+  if (text.includes("stopReason=length") || text.includes("truncated at the model's output token limit")) {
+    return "模型输出触达长度上限，回答被截断";
+  }
   if (text.includes("prep stages")) return "正在准备 Agent 运行环境";
-  if (text.includes("tool-search")) return "正在装载可用工具";
+  if (text.includes("tool-search")) {
+    const n = /cataloged (\d+) tools/.exec(text)?.[1];
+    return n ? `已装载 ${n} 个可用工具` : "正在装载可用工具";
+  }
   if (text.includes("post-tool")) return "工具步骤已结束，正在整理最终回答";
   if (text.includes("reasoning-only")) return "模型只有思考内容，正在重试可见回答";
   if (text.includes("incomplete turn")) return "本轮回答不完整，Gateway 正在补救";
   if (text.includes("Couldn't generate")) return "Agent 未能生成回答";
-  if (text.includes("ClientDisconnect") || text.includes("disconnected")) return "上游连接已断开";
+  if (text.includes("ClientDisconnect") || text.includes("disconnected")) return null;
   if (text.includes("session-resource-loader")) return "正在加载会话资源";
   if (text.includes("memory_index") || text.includes("memory ")) return "正在处理记忆索引";
   return null;
 }
 
-function readFileTail(file, maxBytes = 180_000) {
+function readFileTail(file, maxBytes = 240_000) {
   if (!fs.existsSync(file)) return "";
   const st = fs.statSync(file);
   const start = Math.max(0, st.size - maxBytes);
@@ -489,14 +1040,26 @@ function readFileTail(file, maxBytes = 180_000) {
 }
 
 function parseGatewayLogLine(raw) {
-  const line = String(raw || "").trim();
+  const line = stripAnsi(raw).trim();
   if (!line) return null;
   if (line.startsWith("{")) {
     try {
       const j = JSON.parse(line);
-      const msg = typeof j["1"] === "string" ? j["1"] : typeof j["2"] === "string" ? j["2"] : "";
+      const parts = [];
+      for (const key of ["0", "1", "2", "msg", "message"]) {
+        const v = j[key];
+        if (typeof v === "string" && v.trim()) parts.push(v);
+        else if (v && typeof v === "object") {
+          try {
+            parts.push(JSON.stringify(v));
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      const msg = parts.join(" ");
       const at = j?._meta?.date || "";
-      return { at, msg };
+      return msg ? { at, msg } : null;
     } catch {
       return null;
     }
@@ -513,34 +1076,228 @@ function latestGatewayActivity(sinceMs) {
     path.resolve(process.cwd(), "..", "..", ".tools", "gateway.out.log"),
     path.resolve(process.cwd(), "..", "..", ".tools", "gateway.err.log"),
   ];
-  const items = [];
+  const items = [...latestTrajectoryActivity(sinceMs), ...latestTranscriptActivity(sinceMs)];
+  const logCtx = { modelRound: 0 };
   for (const file of files) {
     const raw = readFileTail(file);
     if (!raw) continue;
+    let pending = null;
+    const flush = () => {
+      if (!pending?.msg) {
+        pending = null;
+        return;
+      }
+      const atMs = pending.at ? Date.parse(pending.at) : NaN;
+      if (!Number.isFinite(atMs)) {
+        pending = null;
+        return;
+      }
+      if (Number.isFinite(sinceMs) && atMs + 1000 < sinceMs) {
+        pending = null;
+        return;
+      }
+      const text = describeGatewayMessage(pending.msg, logCtx);
+      if (text) {
+        items.push({
+          at: pending.at,
+          text,
+          detail: "",
+          key: `${pending.at}|${text}`,
+        });
+      }
+      pending = null;
+    };
     for (const line of raw.split(/\r?\n/)) {
       const parsed = parseGatewayLogLine(line);
-      if (!parsed?.msg) continue;
-      const atMs = parsed.at ? Date.parse(parsed.at) : NaN;
-      if (!Number.isFinite(atMs)) continue;
-      if (Number.isFinite(sinceMs) && atMs + 1000 < sinceMs) continue;
-      const text = describeGatewayMessage(parsed.msg);
-      if (!text) continue;
-      items.push({
-        at: parsed.at,
-        text,
-        key: `${parsed.at}|${text}`,
-      });
+      if (parsed?.msg) {
+        flush();
+        pending = { at: parsed.at, msg: parsed.msg };
+        continue;
+      }
+      const cont = stripAnsi(line).trim();
+      if (pending && cont) {
+        pending.msg += `\n${cont}`;
+      }
     }
+    flush();
   }
   const seen = new Set();
   const uniq = [];
-  items.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  items.sort((a, b) => {
+    const am = Date.parse(a.at);
+    const bm = Date.parse(b.at);
+    if (Number.isFinite(am) && Number.isFinite(bm) && am !== bm) return am - bm;
+    return String(a.at).localeCompare(String(b.at));
+  });
   for (const item of items) {
     if (seen.has(item.key)) continue;
     seen.add(item.key);
     uniq.push(item);
   }
-  return uniq.slice(-8);
+  const rich = uniq.filter((item) => String(item.detail || "").trim());
+  const status = uniq.filter((item) => {
+    if (String(item.detail || "").trim()) return false;
+    const t = String(item.text || "");
+    if (/^已装载 \d+ 个可用工具$/.test(t)) return false;
+    if (/^本轮 Agent 运行已结束$/.test(t)) return false;
+    return true;
+  });
+  const merged = [...rich.slice(-40), ...status.slice(-8)];
+  merged.sort((a, b) => {
+    const am = Date.parse(a.at);
+    const bm = Date.parse(b.at);
+    if (Number.isFinite(am) && Number.isFinite(bm) && am !== bm) return am - bm;
+    return String(a.at).localeCompare(String(b.at));
+  });
+  const seen2 = new Set();
+  const out = [];
+  for (const item of merged) {
+    if (seen2.has(item.key)) continue;
+    seen2.add(item.key);
+    out.push(item);
+  }
+  return out.slice(-48);
+}
+
+function isLoopback(req) {
+  const ra = req.socket.remoteAddress || "";
+  return ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
+}
+
+function openclawConfigPath() {
+  return path.join(OPENCLAW, "openclaw.json");
+}
+
+function maskSecret(value) {
+  const s = String(value || "");
+  if (!s) return "";
+  if (s.length <= 8) return "••••";
+  return `${s.slice(0, 4)}…${s.slice(-4)}`;
+}
+
+function loadOpenclawCfg() {
+  const file = openclawConfigPath();
+  if (!fs.existsSync(file)) {
+    throw new Error(`找不到 ${file}，请先运行 .\\scripts\\setup.ps1`);
+  }
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}
+
+function saveOpenclawCfg(cfg) {
+  const file = openclawConfigPath();
+  const bak = `${file}.bak-agentdesk`;
+  try {
+    fs.copyFileSync(file, bak);
+  } catch {
+    /* ignore */
+  }
+  fs.writeFileSync(file, JSON.stringify(cfg, null, 4) + "\n", "utf8");
+}
+
+function readModelsCatalog() {
+  const cfg = loadOpenclawCfg();
+  const primary = String(cfg?.agents?.defaults?.model?.primary || "");
+  const fallbacks = Array.isArray(cfg?.agents?.defaults?.model?.fallbacks)
+    ? cfg.agents.defaults.model.fallbacks.map(String)
+    : [];
+  const providersIn = cfg?.models?.providers && typeof cfg.models.providers === "object" ? cfg.models.providers : {};
+  const providers = Object.entries(providersIn).map(([id, p]) => {
+    const models = Array.isArray(p?.models) ? p.models : [];
+    return {
+      id,
+      baseUrl: String(p?.baseUrl || ""),
+      api: String(p?.api || "openai-completions"),
+      timeoutSeconds: Number.isFinite(Number(p?.timeoutSeconds)) ? Number(p.timeoutSeconds) : null,
+      apiKeySet: Boolean(p?.apiKey),
+      apiKeyHint: maskSecret(p?.apiKey),
+      models: models.map((m) => {
+        const mid = String(m?.id || "");
+        const input = Array.isArray(m?.input) ? m.input.map(String) : ["text"];
+        return {
+          id: mid,
+          name: String(m?.name || mid),
+          ref: `${id}/${mid}`,
+          vision: input.includes("image"),
+          reasoning: Boolean(m?.reasoning),
+          contextWindow: Number(m?.contextWindow) || null,
+        };
+      }),
+    };
+  });
+  return {
+    configPath: openclawConfigPath(),
+    controlUi: "http://127.0.0.1:18789",
+    primary,
+    fallbacks,
+    providers,
+  };
+}
+
+function writeModelsCatalog(patch) {
+  const cfg = loadOpenclawCfg();
+  if (!cfg.agents) cfg.agents = {};
+  if (!cfg.agents.defaults) cfg.agents.defaults = {};
+  if (!cfg.agents.defaults.model || typeof cfg.agents.defaults.model !== "object") {
+    cfg.agents.defaults.model = {};
+  }
+  if (!cfg.models) cfg.models = { mode: "merge", providers: {} };
+  if (!cfg.models.providers || typeof cfg.models.providers !== "object") cfg.models.providers = {};
+
+  const provider = patch.provider;
+  if (provider && typeof provider === "object") {
+    const pid = String(provider.id || "")
+      .trim()
+      .replace(/[^a-zA-Z0-9_-]/g, "");
+    const modelId = String(provider.modelId || "").trim();
+    const baseUrl = String(provider.baseUrl || "").trim().replace(/\/chat\/completions\/?$/i, "").replace(/\/$/, "");
+    if (!pid) throw new Error("提供商 id 不能为空（如 dashscope）");
+    if (!modelId) throw new Error("模型 id 不能为空（如 qwen3.6-flash）");
+    if (!baseUrl) throw new Error("Base URL 不能为空（不要带 /chat/completions）");
+    const existing = cfg.models.providers[pid] && typeof cfg.models.providers[pid] === "object" ? cfg.models.providers[pid] : {};
+    const models = Array.isArray(existing.models) ? existing.models.slice() : [];
+    const idx = models.findIndex((m) => String(m?.id) === modelId);
+    const vision = Boolean(provider.vision);
+    const row = {
+      id: modelId,
+      name: String(provider.modelName || modelId),
+      reasoning: provider.reasoning !== false,
+      input: vision ? ["text", "image"] : ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: Number(provider.contextWindow) || 1000000,
+      maxTokens: Number(provider.maxTokens) || 32768,
+    };
+    if (idx >= 0) models[idx] = { ...models[idx], ...row };
+    else models.push(row);
+    const next = {
+      ...existing,
+      baseUrl,
+      api: String(provider.api || existing.api || "openai-completions"),
+      timeoutSeconds: Number(provider.timeoutSeconds) || Number(existing.timeoutSeconds) || 420,
+      models,
+    };
+    const newKey = String(provider.apiKey || "").trim();
+    if (newKey) next.apiKey = newKey;
+    else if (!existing.apiKey) throw new Error("该提供商还没有 API Key，请填写");
+    cfg.models.providers[pid] = next;
+    if (!cfg.agents.defaults.models) cfg.agents.defaults.models = {};
+    const ref = `${pid}/${modelId}`;
+    cfg.agents.defaults.models[ref] = {
+      ...(cfg.agents.defaults.models[ref] || {}),
+      alias: String(provider.alias || modelId),
+    };
+    if (provider.setPrimary !== false) {
+      cfg.agents.defaults.model.primary = ref;
+    }
+  }
+
+  if (typeof patch.primary === "string" && patch.primary.trim()) {
+    cfg.agents.defaults.model.primary = patch.primary.trim();
+  }
+  if (Array.isArray(patch.fallbacks)) {
+    cfg.agents.defaults.model.fallbacks = patch.fallbacks.map(String).filter(Boolean);
+  }
+  saveOpenclawCfg(cfg);
+  return readModelsCatalog();
 }
 
 async function handle(req, res) {
@@ -566,15 +1323,32 @@ async function handle(req, res) {
       });
     }
 
+    if ((req.method === "GET" || req.method === "POST") && p === "/api/models-config") {
+      if (!isLoopback(req)) return send(res, 403, { error: "loopback only" });
+      if (req.method === "GET") return send(res, 200, readModelsCatalog());
+      const body = await readBody(req);
+      if (!body || typeof body !== "object") return send(res, 400, { error: "JSON body required" });
+      try {
+        const catalog = writeModelsCatalog(body);
+        audit("models.config.save", {
+          primary: catalog.primary,
+          provider: body?.provider?.id || null,
+        });
+        return send(res, 200, { ok: true, ...catalog });
+      } catch (err) {
+        return send(res, 400, { error: String(err.message || err) });
+      }
+    }
+
     if (req.method === "GET" && p === "/api/local-config") {
       // Loopback-only convenience for local UI; never expose remotely.
-      const ra = req.socket.remoteAddress || "";
-      const local = ra === "127.0.0.1" || ra === "::1" || ra === "::ffff:127.0.0.1";
-      if (!local) return send(res, 403, { error: "loopback only" });
+      if (!isLoopback(req)) return send(res, 403, { error: "loopback only" });
       let token = "";
+      let primary = "openclaw/default";
       try {
         const cfg = JSON.parse(fs.readFileSync(path.join(OPENCLAW, "openclaw.json"), "utf8"));
         token = cfg?.gateway?.auth?.token || "";
+        primary = cfg?.agents?.defaults?.model?.primary || primary;
       } catch {
         /* ignore */
       }
@@ -582,7 +1356,7 @@ async function handle(req, res) {
         gatewayUrl: "http://127.0.0.1:18789",
         bridgeUrl: `http://127.0.0.1:${PORT}`,
         token,
-        model: "openclaw/default",
+        model: primary,
       });
     }
 
@@ -595,6 +1369,38 @@ async function handle(req, res) {
           { type: "dir", name: "outputs", path: "outputs", children: walkTree(LIB_OUT, "", 0, 4, "outputs") },
         ],
       });
+    }
+
+    if (req.method === "GET" && p === "/api/library/raw") {
+      const rel = String(url.searchParams.get("path") || "");
+      if (!rel.startsWith("outputs/") && !rel.startsWith("mine/")) {
+        return send(res, 403, { error: "raw only under outputs/ or mine/" });
+      }
+      const abs = safeJoin(LIBRARY, rel);
+      if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) {
+        return send(res, 404, { error: "not found" });
+      }
+      const ext = path.extname(abs).toLowerCase();
+      const types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".svg": "image/svg+xml",
+        ".pdf": "application/pdf",
+        ".dxf": "application/dxf",
+      };
+      const st = fs.statSync(abs);
+      res.writeHead(200, {
+        "Content-Type": types[ext] || "application/octet-stream",
+        "Content-Length": st.size,
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache",
+        "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(path.basename(abs))}`,
+      });
+      fs.createReadStream(abs).pipe(res);
+      return;
     }
 
     if (req.method === "GET" && p === "/api/library/file") {
@@ -693,6 +1499,13 @@ async function handle(req, res) {
         lines.push(`- \`${rel}\` → \`${abs}\``);
       }
       lines.push("", "完成后将产物写入 `library/outputs/`，并说明保存路径。");
+      const skillName = String(body?.skill || "").trim();
+      if (skillName) {
+        const contract = buildSkillContract(skillName);
+        if (contract?.snippet) {
+          lines.push("", contract.snippet);
+        }
+      }
       const snippet = lines.join("\n");
       audit("library.attach", { paths });
       return send(res, 200, { snippet, paths });
@@ -708,7 +1521,7 @@ async function handle(req, res) {
         const r = linkWorkBuddyWorkspace(body.path);
         return send(res, 200, r);
       }
-      return send(res, 200, { imported: importAllWorkBuddy() });
+      return send(res, 200, { imported: importAllWorkBuddy(), skills: syncWorkBuddySkills() });
     }
 
     if (req.method === "GET" && p === "/api/workbuddy/sessions") {
@@ -717,6 +1530,24 @@ async function handle(req, res) {
 
     if (req.method === "GET" && p === "/api/compat/skills") {
       return send(res, 200, listSkillsCompat());
+    }
+
+    if (req.method === "GET" && p === "/api/skills/contract") {
+      const name = String(url.searchParams.get("name") || "").trim();
+      const contract = buildSkillContract(name);
+      if (!contract) return send(res, 404, { error: "skill not found", name });
+      return send(res, 200, contract);
+    }
+
+    if (req.method === "POST" && p === "/api/skills/match") {
+      const body = await readBody(req);
+      const contract = matchWorkBuddySkill(body?.text, body?.skill);
+      if (!contract) return send(res, 200, { matched: false });
+      return send(res, 200, { matched: true, ...contract });
+    }
+
+    if (req.method === "POST" && p === "/api/skills/sync") {
+      return send(res, 200, { skills: syncWorkBuddySkills() });
     }
 
     if (req.method === "GET" && p === "/api/skills/detail") {
@@ -904,6 +1735,11 @@ async function handle(req, res) {
 }
 
 ensureDirs();
+try {
+  syncWorkBuddySkills();
+} catch {
+  /* WorkBuddy skills are optional */
+}
 // seed a sample note if empty
 if (!fs.existsSync(path.join(LIB_MINE, "README.md"))) {
   fs.writeFileSync(
