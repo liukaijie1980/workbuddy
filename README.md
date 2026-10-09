@@ -35,7 +35,8 @@ OpenClaw Gateway (:18789)
 
 ### 前置
 
-- Windows 10/11 或 Linux（Node 20+）
+- Windows 10/11 或 Linux
+- Node `>=24.16.0 <25` 或 `>=26.1.0`（OpenClaw 硬性要求；`node -v` 自检）
 - OpenClaw（`setup` 脚本会检查 / 安装）
 - 至少一个模型 API Key（或本地 Ollama）
 
@@ -110,9 +111,23 @@ npm run dev
 ```bash
 git pull
 chmod +x scripts/*.sh
+node -v                     # 须满足 >=24.16 <25 或 >=26.1
 ./scripts/setup.sh          # 首次或依赖/模板变更时
 # 编辑 ~/.openclaw/openclaw.json，配置模型 provider 与 API Key
 ./scripts/start.sh          # 前台启动；Ctrl+C 会停掉 Gateway/Bridge/Web
+```
+
+若 `setup.sh` 报 Node 版本不够（常见于 Hermes 自带 Node 22）：
+
+```bash
+# 推荐 nvm 安装 Node 24
+curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+source ~/.nvm/nvm.sh
+nvm install 24
+nvm use 24
+hash -r
+node -v && which node       # 确认不再是 ~/.hermes/node/bin/node
+./scripts/setup.sh
 ```
 
 仅代码更新、配置已就绪时：

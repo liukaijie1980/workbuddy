@@ -23,11 +23,34 @@ need_cmd node
 need_cmd npm
 need_cmd python3
 
-NODE_MAJOR="$(node -p "process.versions.node.split('.')[0]")"
-if [[ "$NODE_MAJOR" -lt 20 ]]; then
-  echo "Node 20+ required (found $(node -v))" >&2
+# OpenClaw requires: Node >=24.16.0 <25 || >=26.1.0
+node_ok="$(node -e '
+const [maj, min] = process.versions.node.split(".").map(Number);
+const ok = (maj === 24 && min >= 16) || maj >= 26;
+process.stdout.write(ok ? "1" : "0");
+')"
+if [[ "$node_ok" != "1" ]]; then
+  echo "OpenClaw needs Node >=24.16.0 (<25) or >=26.1.0; found $(node -v) at $(command -v node)" >&2
+  echo "" >&2
+  echo "Upgrade Node, then re-run ./scripts/setup.sh. Examples:" >&2
+  echo "  # nvm" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash" >&2
+  echo "  source ~/.nvm/nvm.sh && nvm install 24 && nvm use 24" >&2
+  echo "" >&2
+  echo "  # NodeSource (Debian/Ubuntu)" >&2
+  echo "  curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -" >&2
+  echo "  sudo apt-get install -y nodejs" >&2
+  echo "" >&2
+  echo "  # fnm" >&2
+  echo "  curl -fsSL https://fnm.vercel.app/install | bash" >&2
+  echo "  fnm install 24 && fnm use 24" >&2
+  echo "" >&2
+  echo "If PATH still points at Hermes/old Node, put the new node first:" >&2
+  echo "  export PATH=\"\$HOME/.nvm/versions/node/\$(ls \$HOME/.nvm/versions/node | tail -1)/bin:\$PATH\"" >&2
+  echo "  hash -r && node -v && which node" >&2
   exit 1
 fi
+echo "Node: $(node -v) ($(command -v node))"
 
 if ! command -v openclaw >/dev/null 2>&1; then
   echo "OpenClaw CLI not found. Installing globally..."
