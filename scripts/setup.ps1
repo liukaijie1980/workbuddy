@@ -152,5 +152,5 @@ Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Green
 Write-Host "  1. Configure model: openclaw onboard"
 Write-Host "  2. Start:           .\scripts\start.ps1"
-Write-Host "  3. Open http://127.0.0.1:3080 and paste token:"
+Write-Host "  3. Open http://127.0.0.1:3080 (or http://<LAN-IP>:3080 from other PCs) and paste token:"
 Write-Host "     $token"

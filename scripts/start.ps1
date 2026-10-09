@@ -51,6 +51,45 @@ function Wait-Port([int]$Port, [int]$Seconds = 90) {
   return $false
 }
 
+function Get-LanIPv4Addresses {
+  $ips = @()
+  try {
+    $ips = @(
+      Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object {
+          $_.IPAddress -notlike "127.*" -and
+          $_.IPAddress -notlike "169.254.*" -and
+          $_.PrefixOrigin -ne "WellKnown"
+        } |
+        Select-Object -ExpandProperty IPAddress -Unique
+    )
+  } catch {
+    try {
+      $ips = @(
+        [System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+          Where-Object { $_.AddressFamily -eq "InterNetwork" } |
+          ForEach-Object { $_.IPAddressToString } |
+          Where-Object { $_ -notlike "127.*" -and $_ -notlike "169.254.*" }
+      )
+    } catch {
+      $ips = @()
+    }
+  }
+  return $ips
+}
+
+function Ensure-LanFirewallRule([int]$Port) {
+  $name = "AgentDesk Web $Port"
+  try {
+    $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
+    if ($existing) { return }
+    New-NetFirewallRule -DisplayName $name -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -Profile Private,Domain -ErrorAction Stop | Out-Null
+    Write-Host "Added Windows firewall allow rule for TCP $Port (Private/Domain)"
+  } catch {
+    Write-Host "Could not add firewall rule for :$Port (need admin). Other PCs may be blocked until you allow inbound TCP $Port." -ForegroundColor Yellow
+  }
+}
+
 $launch = Find-OpenClawNodeArgs
 if (-not $launch) {
   Write-Host "openclaw not found. Run .\scripts\setup.ps1 first." -ForegroundColor Red
@@ -107,8 +146,19 @@ if (-not (Wait-Port 3090 30)) {
 }
 Write-Host "Bridge listening on 127.0.0.1:3090"
 
-Write-Host "==> Starting AgentDesk Web (http://127.0.0.1:3080)" -ForegroundColor Cyan
+Write-Host "==> Starting AgentDesk Web (LAN-reachable on :3080)" -ForegroundColor Cyan
 if ($token) { Write-Host "Gateway Token: $token" }
+Ensure-LanFirewallRule 3080
+Write-Host "本机:     http://127.0.0.1:3080"
+$lanIps = Get-LanIPv4Addresses
+if ($lanIps.Count -eq 0) {
+  Write-Host "局域网:   (未检测到 IPv4；其他机器可用本机 IP:3080 访问)" -ForegroundColor Yellow
+} else {
+  foreach ($ip in $lanIps) {
+    Write-Host "局域网:   http://${ip}:3080"
+  }
+}
+Write-Host "说明: Gateway/Bridge 仍只监听本机；其他机器只访问 :3080，由 Web 代理转发。" -ForegroundColor DarkGray
 
 Write-Host "==> Building Web (so latest UI changes are served)" -ForegroundColor Cyan
 Push-Location $WebDir

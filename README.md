@@ -35,25 +35,36 @@ OpenClaw Gateway (:18789)
 
 ### 前置
 
-- Windows 10/11
-- 已安装 OpenClaw（`scripts/setup.ps1` 会检查；仓库亦可使用 `.tools` 便携 Node）
+- Windows 10/11 或 Linux（Node 20+）
+- OpenClaw（`setup` 脚本会检查 / 安装）
 - 至少一个模型 API Key（或本地 Ollama）
 
 ### 一键配置
 
 ```powershell
+# Windows
 .\scripts\setup.ps1
+
+# Linux
+chmod +x scripts/*.sh
+./scripts/setup.sh
 ```
 
 ### 启动（Gateway + Bridge + Web）
 
 ```powershell
+# Windows
 .\scripts\start.ps1
+
+# Linux
+./scripts/start.sh
 ```
 
-- Gateway：`http://127.0.0.1:18789`
-- Bridge：`http://127.0.0.1:3090`（资料库 / 定时 / 审计）
-- AgentDesk UI：`http://127.0.0.1:3080`
+- Gateway：`http://127.0.0.1:18789`（仅本机）
+- Bridge：`http://127.0.0.1:3090`（仅本机；资料库 / 定时 / 审计）
+- AgentDesk UI：`http://0.0.0.0:3080`（本机与局域网）
+  - 本机：`http://127.0.0.1:3080`
+  - 其他机器：`http://<本机局域网IP>:3080`（设置里 Gateway/Bridge 建议留空，走同源代理）
 
 ### 兼容性测试
 
@@ -88,7 +99,29 @@ npm install
 npm run dev
 ```
 
-开发态 UI 默认连接 `http://127.0.0.1:18789`（需 Gateway 已启动）。
+开发态 UI 默认走同源代理（`/v1` → Gateway、`/api` → Bridge）。Gateway 需已启动。
+
+### 局域网访问
+
+启动后其他机器打开 `http://<主机IP>:3080`。不要把 Gateway `:18789` 或 Bridge `:3090` 暴露到公网；模型 Key 写入仍限制本机 loopback。若 Windows 防火墙拦截，启动脚本会尝试放行 Private/Domain 入站 TCP 3080（需管理员权限）。Linux 需自行放行入站 TCP 3080（如 `ufw allow 3080/tcp`）。
+
+### Linux：`git pull` 后源码部署
+
+```bash
+git pull
+chmod +x scripts/*.sh
+./scripts/setup.sh          # 首次或依赖/模板变更时
+# 编辑 ~/.openclaw/openclaw.json，配置模型 provider 与 API Key
+./scripts/start.sh          # 前台启动；Ctrl+C 会停掉 Gateway/Bridge/Web
+```
+
+仅代码更新、配置已就绪时：
+
+```bash
+git pull
+cd apps/web && npm install && npm run build && cd ../..
+./scripts/start.sh
+```
 
 ## 许可证
 

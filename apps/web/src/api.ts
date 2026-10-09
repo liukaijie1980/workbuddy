@@ -42,25 +42,53 @@ export type AuditEntry = {
 
 const SETTINGS_KEY = "agentdesk.settings.v2";
 
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+}
+
+function isLoopbackBase(base: string): boolean {
+  const raw = base.trim();
+  if (!raw) return false;
+  try {
+    return isLoopbackHost(new URL(raw, "http://local.invalid").hostname);
+  } catch {
+    return /^(https?:\/\/)?(127\.0\.0\.1|localhost|\[::1\])([:/]|$)/i.test(raw);
+  }
+}
+
+/** Prefer same-origin proxy when UI is opened from another machine. */
+function sanitizeSettingsForPage(settings: AgentDeskSettings): AgentDeskSettings {
+  if (typeof window === "undefined" || isLoopbackHost(window.location.hostname)) {
+    return settings;
+  }
+  const next = { ...settings };
+  if (!next.gatewayBase.trim() || isLoopbackBase(next.gatewayBase)) next.gatewayBase = "";
+  if (!next.bridgeBase.trim() || isLoopbackBase(next.bridgeBase)) next.bridgeBase = "";
+  return next;
+}
+
 export function loadSettings(): AgentDeskSettings {
+  let loaded: AgentDeskSettings | null = null;
   const raw = localStorage.getItem(SETTINGS_KEY);
   if (raw) {
     try {
-      return { ...defaultSettings(), ...JSON.parse(raw) };
+      loaded = { ...defaultSettings(), ...JSON.parse(raw) };
     } catch {
       /* ignore */
     }
   }
-  // migrate v1
-  const v1 = localStorage.getItem("agentdesk.settings.v1");
-  if (v1) {
-    try {
-      return { ...defaultSettings(), ...JSON.parse(v1) };
-    } catch {
-      /* ignore */
+  if (!loaded) {
+    const v1 = localStorage.getItem("agentdesk.settings.v1");
+    if (v1) {
+      try {
+        loaded = { ...defaultSettings(), ...JSON.parse(v1) };
+      } catch {
+        /* ignore */
+      }
     }
   }
-  return defaultSettings();
+  return sanitizeSettingsForPage(loaded || defaultSettings());
 }
 
 export function saveSettings(settings: AgentDeskSettings) {
@@ -317,7 +345,7 @@ export async function* streamChat(
 }
 
 export function libraryRawUrl(settings: AgentDeskSettings, relPath: string) {
-  const base = settings.bridgeBase.replace(/\/$/, "");
+  const base = resolveBase(settings.bridgeBase);
   return `${base}/api/library/raw?path=${encodeURIComponent(relPath)}`;
 }
 

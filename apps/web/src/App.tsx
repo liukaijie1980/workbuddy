@@ -1384,20 +1384,20 @@ export default function App() {
               <section>
                 <h2 className="panel-title">连接</h2>
                 <div className="field">
-                  <label>Gateway Base（空=同域 /v1）</label>
+                  <label>Gateway Base（空=本页同源 /v1，局域网推荐留空）</label>
                   <input
                     value={settings.gatewayBase}
-                    placeholder="http://127.0.0.1:18789"
+                    placeholder="留空即可（经 Web 代理到本机 Gateway）"
                     onChange={(e) =>
                       setSettings((s) => ({ ...s, gatewayBase: e.target.value }))
                     }
                   />
                 </div>
                 <div className="field">
-                  <label>Bridge Base（空=同域 /api）</label>
+                  <label>Bridge Base（空=本页同源 /api，局域网推荐留空）</label>
                   <input
                     value={settings.bridgeBase}
-                    placeholder="http://127.0.0.1:3090"
+                    placeholder="留空即可（经 Web 代理到本机 Bridge）"
                     onChange={(e) =>
                       setSettings((s) => ({ ...s, bridgeBase: e.target.value }))
                     }
@@ -1414,6 +1414,8 @@ export default function App() {
                   />
                 </div>
                 <p className="hint">
+                  其他机器请访问本机局域网地址的 :3080；Gateway/Bridge 仍只监听本机，由 Web 代理转发。
+                  <br />
                   Gateway: {gatewayDetail}
                   <br />
                   Bridge: {bridgeDetail}
