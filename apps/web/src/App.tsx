@@ -22,6 +22,7 @@ import {
   fetchWbSessions,
   importWorkBuddy,
   loadSettings,
+  newId,
   probeBridge,
   probeGateway,
   runCronNow,
@@ -1053,7 +1054,7 @@ export default function App() {
   }
 
   function newConversation() {
-    setSettings((s) => ({ ...s, conversationId: crypto.randomUUID() }));
+    setSettings((s) => ({ ...s, conversationId: newId() }));
     setMessages([]);
     setSelected(new Set());
     setPendingFiles([]);
